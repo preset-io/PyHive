@@ -8,9 +8,12 @@ Many docstrings in this file are based on the PEP, which is in the public domain
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
+import base64
 import datetime
 import re
 from decimal import Decimal
+from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, create_default_context
+
 
 from TCLIService import TCLIService
 from TCLIService import constants
@@ -25,6 +28,7 @@ from future.utils import iteritems
 import getpass
 import logging
 import sys
+import thrift.transport.THttpClient
 import thrift.protocol.TBinaryProtocol
 import thrift.transport.TSocket
 import thrift.transport.TTransport
@@ -38,6 +42,51 @@ _logger = logging.getLogger(__name__)
 
 _TIMESTAMP_PATTERN = re.compile(r'(\d+-\d+-\d+ \d+:\d+:\d+(\.\d{,6})?)')
 
+ssl_cert_parameter_map = {
+    "none": CERT_NONE,
+    "optional": CERT_OPTIONAL,
+    "required": CERT_REQUIRED,
+}
+
+
+def get_sasl_client(host, sasl_auth, service=None, username=None, password=None):
+    import sasl
+    sasl_client = sasl.Client()
+    sasl_client.setAttr('host', host)
+
+    if sasl_auth == 'GSSAPI':
+        sasl_client.setAttr('service', service)
+    elif sasl_auth == 'PLAIN':
+        sasl_client.setAttr('username', username)
+        sasl_client.setAttr('password', password)
+    else:
+        raise ValueError("sasl_auth only supports GSSAPI and PLAIN")
+
+    sasl_client.init()
+    return sasl_client
+
+
+def get_pure_sasl_client(host, sasl_auth, service=None, username=None, password=None):
+    from pyhive.sasl_compat import PureSASLClient
+
+    if sasl_auth == 'GSSAPI':
+        sasl_kwargs = {'service': service}
+    elif sasl_auth == 'PLAIN':
+        sasl_kwargs = {'username': username, 'password': password}
+    else:
+        raise ValueError("sasl_auth only supports GSSAPI and PLAIN")
+
+    return PureSASLClient(host=host, **sasl_kwargs)
+
+
+def get_installed_sasl(host, sasl_auth, service=None, username=None, password=None):
+    try:
+        return get_sasl_client(host=host, sasl_auth=sasl_auth, service=service, username=username, password=password)
+        # The sasl library is available
+    except ImportError:
+        # Fallback to pure-sasl library
+        return get_pure_sasl_client(host=host, sasl_auth=sasl_auth, service=service, username=username, password=password)
+    
 
 def _parse_timestamp(value):
     if value:
@@ -97,9 +146,21 @@ def connect(*args, **kwargs):
 class Connection(object):
     """Wraps a Thrift session"""
 
-    def __init__(self, host=None, port=None, username=None, database='default', auth=None,
-                 configuration=None, kerberos_service_name=None, password=None,
-                 thrift_transport=None):
+    def __init__(
+        self,
+        host=None,
+        port=None,
+        scheme=None,
+        username=None,
+        database='default',
+        auth=None,
+        configuration=None,
+        kerberos_service_name=None,
+        password=None,
+        check_hostname=None,
+        ssl_cert=None,
+        thrift_transport=None
+    ):
         """Connect to HiveServer2
 
         :param host: What host HiveServer2 runs on
@@ -116,6 +177,35 @@ class Connection(object):
         https://github.com/cloudera/impyla/blob/255b07ed973d47a3395214ed92d35ec0615ebf62
         /impala/_thrift_api.py#L152-L160
         """
+        if scheme in ("https", "http") and thrift_transport is None:
+            port = port or 1000
+            ssl_context = None
+            if scheme == "https":
+                ssl_context = create_default_context()
+                ssl_context.check_hostname = check_hostname == "true"
+                ssl_cert = ssl_cert or "none"
+                ssl_context.verify_mode = ssl_cert_parameter_map.get(ssl_cert, CERT_NONE)
+            thrift_transport = thrift.transport.THttpClient.THttpClient(
+                uri_or_host="{scheme}://{host}:{port}/cliservice/".format(
+                    scheme=scheme, host=host, port=port
+                ),
+                ssl_context=ssl_context,
+            )
+
+            if auth in ("BASIC", "NOSASL", "NONE", None):
+                # Always needs the Authorization header
+                self._set_authorization_header(thrift_transport, username, password)
+            elif auth == "KERBEROS" and kerberos_service_name:
+                self._set_kerberos_header(thrift_transport, kerberos_service_name, host)
+            else:
+                raise ValueError(
+                    "Authentication is not valid use one of:"
+                    "BASIC, NOSASL, KERBEROS, NONE"
+                )
+            host, port, auth, kerberos_service_name, password = (
+                None, None, None, None, None
+            )
+
         username = username or getpass.getuser()
         configuration = configuration or {}
 
@@ -149,7 +239,6 @@ class Connection(object):
                 self._transport = thrift.transport.TTransport.TBufferedTransport(socket)
             elif auth in ('LDAP', 'KERBEROS', 'NONE', 'CUSTOM'):
                 # Defer import so package dependency is optional
-                import sasl
                 import thrift_sasl
 
                 if auth == 'KERBEROS':
@@ -160,20 +249,8 @@ class Connection(object):
                     if password is None:
                         # Password doesn't matter in NONE mode, just needs to be nonempty.
                         password = 'x'
-
-                def sasl_factory():
-                    sasl_client = sasl.Client()
-                    sasl_client.setAttr('host', host)
-                    if sasl_auth == 'GSSAPI':
-                        sasl_client.setAttr('service', kerberos_service_name)
-                    elif sasl_auth == 'PLAIN':
-                        sasl_client.setAttr('username', username)
-                        sasl_client.setAttr('password', password)
-                    else:
-                        raise AssertionError
-                    sasl_client.init()
-                    return sasl_client
-                self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket)
+                
+                self._transport = thrift_sasl.TSaslClientTransport(lambda: get_installed_sasl(host=host, sasl_auth=sasl_auth, service=kerberos_service_name, username=username, password=password), sasl_auth, socket)
             else:
                 # All HS2 config options:
                 # https://cwiki.apache.org/confluence/display/Hive/Setting+Up+HiveServer2#SettingUpHiveServer2-Configuration
@@ -206,6 +283,45 @@ class Connection(object):
         except:
             self._transport.close()
             raise
+
+    @staticmethod
+    def _set_authorization_header(transport, username=None, password=None):
+        username = username or "user"
+        password = password or "pass"
+        auth_credentials = "{username}:{password}".format(
+            username=username, password=password
+        ).encode("UTF-8")
+        auth_credentials_base64 = base64.standard_b64encode(auth_credentials).decode(
+            "UTF-8"
+        )
+        transport.setCustomHeaders(
+            {
+                "Authorization": "Basic {auth_credentials_base64}".format(
+                    auth_credentials_base64=auth_credentials_base64
+                )
+            }
+        )
+
+    @staticmethod
+    def _set_kerberos_header(transport, kerberos_service_name, host):
+        import kerberos
+
+        __, krb_context = kerberos.authGSSClientInit(
+            service="{kerberos_service_name}@{host}".format(
+                kerberos_service_name=kerberos_service_name, host=host
+            )
+        )
+        kerberos.authGSSClientClean(krb_context, "")
+        kerberos.authGSSClientStep(krb_context, "")
+        auth_header = kerberos.authGSSClientResponse(krb_context)
+
+        transport.setCustomHeaders(
+            {
+                "Authorization": "Negotiate {auth_header}".format(
+                    auth_header=auth_header
+                )
+            }
+        )
 
     def __enter__(self):
         """Transport should already be opened by __init__"""
