@@ -1,7 +1,6 @@
 LIB_NAME = 'PyHive'
 String currentVersion = ""
 
-
 podTemplate(
     imagePullSecrets: ['preset-pull'],
     nodeUsageMode: 'NORMAL',
@@ -20,7 +19,7 @@ podTemplate(
         containerTemplate(
             alwaysPullImage: true,
             name: 'py-ci',
-            image: 'preset/python:3.8.9-ci',
+            image: 'preset/python:3.10.13-2024-02-21-ci',
             ttyEnabled: true,
             command: 'cat'
         )
@@ -32,8 +31,12 @@ podTemplate(
                 checkout scm
             }
 
+            stage('Install System Dependencies') {
+                sh 'apt-get update && apt-get install -y libkrb5-dev python3-dev libsasl2-dev'
+            }
+
             stage('Tests') {
-                sh(script: 'pip install -e . && pip install -r requirements-dev.txt', label: 'install dependencies')
+                sh(script: 'pip install -e . && pip install -r dev_requirements.txt', label: 'install dependencies')
                 parallel(
                     check: {
                         currentVersion = sh(
@@ -58,12 +61,13 @@ podTemplate(
         container('py-ci') {
             stage('Package Release') {
                 if (env.BRANCH_NAME.startsWith("PR-")) {
+                    sh(script:"git config --global --add safe.directory /home/jenkins/agent/workspace/preset-io_PyHive_${env.BRANCH_NAME}", label: 'Setting safe directory')
                     def shortGitRev = sh(
                             returnStdout: true,
                             script: 'git rev-parse --short HEAD'
                     ).trim()
                     def pullRequestVersion = "${currentVersion}+${env.BRANCH_NAME}.${shortGitRev}"
-                    sh(script:"sed -i \'s/version = ${currentVersion}/version = ${pullRequestVersion}/g\' setup.cfg", label: 'Changing version for PR')
+                    sh(script:"sed -i \'s/version = ${currentVersion}/version = ${pullRequestVersion}/g\' pyhive/__init__.py", label: 'Changing version for PR')
                     sh(script:"echo PR version: ${pullRequestVersion}", label: 'PR Release candidate version')
                 }
                 sh(script: 'python setup.py sdist --formats=gztar', label: 'Bundling release')
