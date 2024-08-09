@@ -67,7 +67,7 @@ podTemplate(
                             script: 'git rev-parse --short HEAD'
                     ).trim()
                     def pullRequestVersion = "${currentVersion}+${env.BRANCH_NAME}.${shortGitRev}"
-                    sh(script:"sed -i \'s/version = ${currentVersion}/version = ${pullRequestVersion}/g\' pyhive/__init__.py", label: 'Changing version for PR')
+                    sh(script:"sed -i 's/__version__ = \"${currentVersion}\"/__version__ = \"${pullRequestVersion}\"/g' pyhive/__init__.py", label: 'Changing version for PR')
                     sh(script:"echo PR version: ${pullRequestVersion}", label: 'PR Release candidate version')
                 }
                 sh(script: 'python setup.py sdist --formats=gztar', label: 'Bundling release')
