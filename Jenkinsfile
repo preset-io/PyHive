@@ -93,6 +93,18 @@ podTemplate(
                     }
                 }
             }
+
+            stage('Tag Release') {
+                if (env.BRANCH_NAME == 'master') {
+                    sshagent(credentials: ['gh-preset-machine-ssh-pk']) {
+                        sh("git config --global --add safe.directory '*'")
+                        sh("git config user.email 'ci@preset.io'")
+                        sh("git config user.name 'Jenkins CI'")
+                        sh("git tag -a v${currentVersion} -m 'Release v${currentVersion}'")
+                        sh("GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' git push git@github.com:preset-io/PyHive.git v${currentVersion}")
+                    }
+                }
+            }
         }
     }
 }
