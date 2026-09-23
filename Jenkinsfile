@@ -44,14 +44,38 @@ podTemplate(
                                 returnStdout: true,
                                 label: 'Get current version'
                         ).trim()
-                        def retVal = sh(
-                                script: "curl -I -f https://pypi.devops.preset.zone/${LIB_NAME}/${LIB_NAME}-${currentVersion}.tar.gz",
-                                returnStatus: true,
-                                label: 'Check for existing tarball'
-                        )
-                        // If the thing exists, we should bail as we don't want to overwrite
-                        if (retVal == 0) {
-                            error("Version ${currentVersion} of ${LIB_NAME} already exists! Version bump required.")
+                        container('ci') {
+                            withCredentials([
+                                [
+                                    $class           : 'AmazonWebServicesCredentialsBinding',
+                                    credentialsId    : 'ci-user',
+                                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY',
+                                ]
+                            ]) {
+                                def retVal = sh(
+                                        script: """
+                                            set -eu
+                                            if aws s3api head-object --bucket preset-pypi --key '${LIB_NAME}/${LIB_NAME}-${currentVersion}.tar.gz' > /dev/null 2> head-object.err; then
+                                                exit 0
+                                            fi
+                                            if grep -q '(404)' head-object.err; then
+                                                exit 3
+                                            fi
+                                            cat head-object.err >&2
+                                            exit 1
+                                        """,
+                                        returnStatus: true,
+                                        label: 'Check for existing tarball via AWS API'
+                                )
+                                // This is an early version gate, not the atomic write guard.
+                                if (retVal == 0) {
+                                    error("Version ${currentVersion} of ${LIB_NAME} already exists! Version bump required.")
+                                }
+                                if (retVal != 3) {
+                                    error('Could not check the release in S3; refusing to publish.')
+                                }
+                            }
                         }
                     }
                 )
@@ -70,7 +94,7 @@ podTemplate(
                     sh(script:"sed -i 's/__version__ = \"${currentVersion}\"/__version__ = \"${pullRequestVersion}\"/g' pyhive/__init__.py", label: 'Changing version for PR')
                     sh(script:"echo PR version: ${pullRequestVersion}", label: 'PR Release candidate version')
                 }
-                sh(script: 'python setup.py sdist --formats=gztar', label: 'Bundling release')
+                sh(script: 'rm -rf dist && python setup.py sdist --formats=gztar', label: 'Bundling release')
                 sh(script: "mkdir -p dist/${LIB_NAME} && mv dist/*.gz dist/${LIB_NAME}", label: 'Setup release folder')
             }
         }
@@ -86,7 +110,24 @@ podTemplate(
                     ]
                 ]) {
                     if ((env.BRANCH_NAME == 'master') || (env.BRANCH_NAME.startsWith("PR-"))) {
-                        sh(script: "aws s3 sync ./dist s3://preset-pypi", label: "Uploading to s3")
+                        // Match the Drill publisher: CLI v1 cannot express If-None-Match.
+                        // S3 rejects an existing key atomically, including concurrent writes.
+                        sh(
+                            script: '''
+                                set -eu
+                                python -m pip install --quiet 'boto3>=1.36,<2'
+                                for artifact in dist/PyHive/*.tar.gz; do
+                                    test -f "$artifact"
+                                    key="${artifact#dist/}"
+                                    BUCKET='preset-pypi' KEY="$key" ARTIFACT="$artifact" \
+                                      python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
+                                    aws s3api get-object --bucket preset-pypi --key "$key" stored.tar.gz > /dev/null
+                                    cmp "$artifact" stored.tar.gz
+                                    rm stored.tar.gz
+                                done
+                            ''',
+                            label: 'Upload without overwrite and verify stored tarball'
+                        )
                     }
                     else {
                         echo "Skipping upload as this isn't master..."
