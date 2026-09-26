@@ -9,6 +9,8 @@ from __future__ import absolute_import
 from __future__ import unicode_literals
 
 import base64
+import binascii
+import socket
 import datetime
 import re
 from decimal import Decimal
@@ -92,9 +94,15 @@ def _parse_timestamp(value):
     if value:
         match = _TIMESTAMP_PATTERN.match(value)
         if match:
+            rest = value[match.end():]
+            if rest and not (rest.isdigit() and set(rest) == {'0'}):
+                # Hive TIMESTAMP keeps nanoseconds; datetime cannot. Refuse rather than
+                # silently truncate (trailing zero digits are dropped losslessly).
+                raise DataError(
+                    'Cannot convert "{}" into a datetime without losing precision; '
+                    'cast the column to STRING to read it exactly'.format(value))
             if match.group(2):
                 format = '%Y-%m-%d %H:%M:%S.%f'
-                # use the pattern to truncate the value
                 value = match.group()
             else:
                 format = '%Y-%m-%d %H:%M:%S'
@@ -112,6 +120,41 @@ TYPES_CONVERTER = {"DECIMAL_TYPE": Decimal,
 
 
 class HiveParamEscaper(common.ParamEscaper):
+    _BIGINT_MIN = -(2 ** 63)
+
+    def escape_item(self, item):
+        if isinstance(item, bool):
+            return 'true' if item else 'false'
+        if isinstance(item, Decimal):
+            return self.escape_decimal(item)
+        if isinstance(item, float):
+            return self.escape_float(item)
+        if isinstance(item, int) and item == self._BIGINT_MIN:
+            # -9223372036854775808 is parsed as the negation of a literal that does not fit
+            # in BIGINT, so Hive types it DECIMAL.
+            return '({} - 1)'.format(self._BIGINT_MIN + 1)
+        if isinstance(item, bytes):
+            # BINARY value: bytes are not text and may not be valid UTF-8.
+            return "unhex('{}')".format(binascii.hexlify(item).decode('ascii'))
+        if isinstance(item, datetime.datetime) and item.utcoffset() is not None:
+            raise ProgrammingError(
+                "Cannot bind timezone-aware datetime {!r}: Hive TIMESTAMP has no time zone. "
+                "Convert it to a naive datetime first.".format(item))
+        return super(HiveParamEscaper, self).escape_item(item)
+
+    def escape_decimal(self, item):
+        if not item.is_finite():
+            raise ProgrammingError("Hive DECIMAL cannot represent {}".format(item))
+        # BD makes Hive type the literal DECIMAL with every digit kept.
+        return '{:f}BD'.format(item)
+
+    def escape_float(self, item):
+        if item != item or item in (float('inf'), float('-inf')):
+            name = 'NaN' if item != item else ('Infinity' if item > 0 else '-Infinity')
+            return "CAST('{}' AS DOUBLE)".format(name)
+        # A plain 0.1 would be typed DECIMAL; the D suffix keeps it DOUBLE.
+        return '{!r}D'.format(item)
+
     def escape_string(self, item):
         # backslashes and single quotes need to be escaped
         # TODO verify against parser
@@ -260,13 +303,16 @@ class Connection(object):
                     "authentication are supported, got {}".format(auth))
 
         protocol = thrift.protocol.TBinaryProtocol.TBinaryProtocol(self._transport)
-        self._client = TCLIService.Client(protocol)
+        self._client = _ClientWrapper(TCLIService.Client(protocol))
         # oldest version that still contains features we care about
         # "V6 uses binary type for binary payload (was string) and uses columnar result set"
         protocol_version = ttypes.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6
 
         try:
-            self._transport.open()
+            try:
+                self._transport.open()
+            except _TRANSPORT_ERRORS as e:
+                raise _connection_lost(e)
             open_session_req = ttypes.TOpenSessionReq(
                 client_protocol=protocol_version,
                 configuration=configuration,
@@ -334,8 +380,11 @@ class Connection(object):
     def close(self):
         """Close the underlying session and Thrift transport"""
         req = ttypes.TCloseSessionReq(sessionHandle=self._sessionHandle)
-        response = self._client.CloseSession(req)
-        self._transport.close()
+        try:
+            response = self._client.CloseSession(req)
+        finally:
+            # Release the socket even when the server is already gone.
+            self._transport.close()
         _check_status(response)
 
     def commit(self):
@@ -587,6 +636,25 @@ for type_id in constants.PRIMITIVE_TYPES:
     setattr(sys.modules[__name__], name, DBAPITypeObject([name]))
 
 
+# PEP 249 type constructors
+Date = datetime.date
+Time = datetime.time
+Timestamp = datetime.datetime
+Binary = bytes
+
+
+def DateFromTicks(ticks):
+    return Date.fromtimestamp(ticks)
+
+
+def TimeFromTicks(ticks):
+    return Timestamp.fromtimestamp(ticks).time()
+
+
+def TimestampFromTicks(ticks):
+    return Timestamp.fromtimestamp(ticks)
+
+
 #
 # Private utilities
 #
@@ -609,6 +677,48 @@ def _unwrap_column(col, type_=None):
                 result = [converter(row) if row else row for row in result]
             return result
     raise DataError("Got empty column value {}".format(col))  # pragma: no cover
+
+
+_TRANSPORT_ERRORS = (
+    thrift.transport.TTransport.TTransportException,
+    socket.error,
+    EOFError,
+)
+
+
+class _ClientWrapper(object):
+    """Proxy for the Thrift client that raises transport failures as ``OperationalError``.
+
+    A dropped or refused connection surfaces from Thrift as ``TTransportException`` or
+    ``socket.error``, which are not DB-API exceptions, so callers such as connection pools
+    cannot tell a lost connection from a programming error.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except _TRANSPORT_ERRORS as e:
+                raise _connection_lost(e)
+        return call
+
+
+def _connection_lost(e):
+    err = OperationalError('Lost connection to HiveServer2: {}'.format(e))
+    err.__cause__ = e
+    return err
+
+
+def is_connection_lost(e):
+    """True if ``e`` was raised because the connection to HiveServer2 failed."""
+    return isinstance(e, OperationalError) and isinstance(e.__cause__, _TRANSPORT_ERRORS)
 
 
 def _check_status(response):

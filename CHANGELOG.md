@@ -1,3 +1,26 @@
+0.7.0.4
+=======
+
+- Hive DB-API: bind ``Decimal`` exactly (``<digits>BD``), keep ``float``
+  parameters DOUBLE, bind the minimum BIGINT, bind ``bytes`` as BINARY and
+  reject timezone-aware datetimes; add the PEP 249 type constructors
+  (``Binary``, ``Date``, ``Timestamp``, ...). TIMESTAMP values with non-zero
+  nanoseconds raise ``DataError`` instead of being truncated.
+- Hive DB-API: a lost, reset or refused connection raises ``OperationalError``
+  (the Thrift transport error is its ``__cause__``) instead of a raw
+  ``TTransportException``; ``Connection.close`` releases the socket even when
+  the server is gone.
+- Hive SQLAlchemy dialect: ``is_disconnect`` recognises lost connections, so
+  ``pool_pre_ping`` and pool invalidation work after a server restart;
+  ``get_table_names`` no longer lists views and ``get_view_names`` lists only
+  views; columns reflect ``decimal(p,s)``, ``varchar(n)``, ``char(n)``,
+  ``double``, ``binary`` and ``array``/``map``/``struct``/``uniontype`` (with the
+  full Hive type) and carry their comments; ``get_table_comment``,
+  ``get_view_definition``, ``get_unique_constraints`` and
+  ``get_check_constraints`` are implemented; ``Numeric(p, s)`` DDL keeps its
+  precision and scale; ``TINYINT`` compiles; values can be bound against
+  reflected DATE/TIMESTAMP/DECIMAL columns.
+
 0.7.0.3
 =======
 
