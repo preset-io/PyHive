@@ -44,7 +44,30 @@ TYPES_CONVERTER = {
 }
 
 
+_BIGINT_MIN = -(2 ** 63)
+
+
 class PrestoParamEscaper(common.ParamEscaper):
+    def escape_item(self, item):
+        if isinstance(item, Decimal):
+            return self.escape_decimal(item)
+        return super(PrestoParamEscaper, self).escape_item(item)
+
+    def escape_decimal(self, item):
+        # A bare numeric literal with a fraction is a DOUBLE in Presto; a typed
+        # DECIMAL literal keeps every digit and the scale of the value.
+        if not item.is_finite():
+            raise ProgrammingError("Unsupported decimal value {}".format(item))
+        return "DECIMAL '{}'".format(format(item, 'f'))
+
+    def escape_number(self, item):
+        # The parser reads -9223372036854775808 as the negation of
+        # 9223372036854775808, which is out of BIGINT range. Spell the minimum
+        # as an expression of the same type instead.
+        if item == _BIGINT_MIN and not isinstance(item, (bool, float)):
+            return "({} - 1)".format(_BIGINT_MIN + 1)
+        return super(PrestoParamEscaper, self).escape_number(item)
+
     def escape_datetime(self, item, format):
         _type = "timestamp" if isinstance(item, datetime.datetime) else "date"
         formatted = super(PrestoParamEscaper, self).escape_datetime(item, format, 3)

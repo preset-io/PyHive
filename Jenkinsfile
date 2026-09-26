@@ -1,5 +1,9 @@
 LIB_NAME = 'PyHive'
 String currentVersion = ""
+// Normalized sdist filename for currentVersion; see scripts/release_artifact.py.
+String currentArtifact = ""
+// Normalized sdist filename actually built (PR builds carry a local version).
+String releaseArtifact = ""
 
 podTemplate(
     imagePullSecrets: ['preset-pull'],
@@ -36,13 +40,29 @@ podTemplate(
             }
 
             stage('Tests') {
-                sh(script: 'pip install -e . && pip install -r dev_requirements.txt', label: 'install dependencies')
+                sh(script: "pip install -e . && pip install -r dev_requirements.txt && pip install packaging 'setuptools>=69.3'", label: 'install dependencies')
+                sh(
+                    script: '''
+                        set -eu
+                        python -m venv /tmp/unit
+                        /tmp/unit/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=2.0,<2.1' 'pytest>=8,<9' mock packaging 'setuptools>=69.3'
+                        # Offline suites only: the other pyhive/tests modules need live servers.
+                        PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit/bin/python -m pytest -c /dev/null --rootdir . -q \
+                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py scripts/test_release_artifact.py
+                    ''',
+                    label: 'Offline unit tests'
+                )
                 parallel(
                     check: {
                         currentVersion = sh(
                                 script: "python setup.py --version",
                                 returnStdout: true,
                                 label: 'Get current version'
+                        ).trim()
+                        currentArtifact = sh(
+                                script: "python scripts/release_artifact.py sdist '${LIB_NAME}' '${currentVersion}'",
+                                returnStdout: true,
+                                label: 'Get normalized release filename'
                         ).trim()
                         container('ci') {
                             withCredentials([
@@ -56,7 +76,7 @@ podTemplate(
                                 def retVal = sh(
                                         script: """
                                             set -eu
-                                            if aws s3api head-object --bucket preset-pypi --key '${LIB_NAME}/${LIB_NAME}-${currentVersion}.tar.gz' > /dev/null 2> head-object.err; then
+                                            if aws s3api head-object --bucket preset-pypi --key '${LIB_NAME}/${currentArtifact}' > /dev/null 2> head-object.err; then
                                                 exit 0
                                             fi
                                             if grep -q '(404)' head-object.err; then
@@ -84,18 +104,29 @@ podTemplate(
 
         container('py-ci') {
             stage('Package Release') {
+                String releaseVersion = currentVersion
                 if (env.BRANCH_NAME.startsWith("PR-")) {
                     sh(script:"git config --global --add safe.directory /home/jenkins/agent/workspace/preset-io_PyHive_${env.BRANCH_NAME}", label: 'Setting safe directory')
                     def shortGitRev = sh(
                             returnStdout: true,
                             script: 'git rev-parse --short HEAD'
                     ).trim()
-                    def pullRequestVersion = "${currentVersion}+${env.BRANCH_NAME}.${shortGitRev}"
-                    sh(script:"sed -i 's/__version__ = \"${currentVersion}\"/__version__ = \"${pullRequestVersion}\"/g' pyhive/__init__.py", label: 'Changing version for PR')
-                    sh(script:"echo PR version: ${pullRequestVersion}", label: 'PR Release candidate version')
+                    releaseVersion = sh(
+                            returnStdout: true,
+                            script: "python scripts/release_artifact.py version '${currentVersion}' '${env.BRANCH_NAME}' '${shortGitRev}'",
+                            label: 'Normalize PR version'
+                    ).trim()
+                    sh(script:"sed -i 's/__version__ = \"${currentVersion}\"/__version__ = \"${releaseVersion}\"/g' pyhive/__init__.py", label: 'Changing version for PR')
+                    sh(script:"echo PR version: ${releaseVersion}", label: 'PR Release candidate version')
                 }
+                releaseArtifact = sh(
+                        returnStdout: true,
+                        script: "python scripts/release_artifact.py sdist '${LIB_NAME}' '${releaseVersion}'",
+                        label: 'Get normalized release filename'
+                ).trim()
                 sh(script: 'rm -rf dist && python setup.py sdist --formats=gztar', label: 'Bundling release')
-                sh(script: "mkdir -p dist/${LIB_NAME} && mv dist/*.gz dist/${LIB_NAME}", label: 'Setup release folder')
+                // Fail here if the build tool named the artifact differently from the checked key.
+                sh(script: "test -f 'dist/${releaseArtifact}' && mkdir -p dist/${LIB_NAME} && mv 'dist/${releaseArtifact}' dist/${LIB_NAME}/", label: 'Setup release folder')
             }
         }
 
@@ -112,22 +143,23 @@ podTemplate(
                     if ((env.BRANCH_NAME == 'master') || (env.BRANCH_NAME.startsWith("PR-"))) {
                         // Match the Drill publisher: CLI v1 cannot express If-None-Match.
                         // S3 rejects an existing key atomically, including concurrent writes.
+                        withEnv(["RELEASE_KEY=${LIB_NAME}/${releaseArtifact}"]) {
                         sh(
                             script: '''
                                 set -eu
                                 python -m pip install --quiet 'boto3>=1.36,<2'
-                                for artifact in dist/PyHive/*.tar.gz; do
-                                    test -f "$artifact"
-                                    key="${artifact#dist/}"
-                                    BUCKET='preset-pypi' KEY="$key" ARTIFACT="$artifact" \
-                                      python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
-                                    aws s3api get-object --bucket preset-pypi --key "$key" stored.tar.gz > /dev/null
-                                    cmp "$artifact" stored.tar.gz
-                                    rm stored.tar.gz
-                                done
+                                # The same normalized name the existence check used.
+                                artifact="dist/$RELEASE_KEY"
+                                test -f "$artifact"
+                                BUCKET='preset-pypi' KEY="$RELEASE_KEY" ARTIFACT="$artifact" \
+                                  python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
+                                aws s3api get-object --bucket preset-pypi --key "$RELEASE_KEY" stored.tar.gz > /dev/null
+                                cmp "$artifact" stored.tar.gz
+                                rm stored.tar.gz
                             ''',
                             label: 'Upload without overwrite and verify stored tarball'
                         )
+                        }
                     }
                     else {
                         echo "Skipping upload as this isn't master..."
