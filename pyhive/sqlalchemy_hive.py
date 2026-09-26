@@ -72,6 +72,13 @@ class HiveDate(HiveStringTypeBase):
         return self.impl
 
 
+class HiveDateResult(types.Date):
+    """Plain Date columns: Hive returns DATE values as 'YYYY-MM-DD' strings."""
+
+    def result_processor(self, dialect, coltype):
+        return HiveDate.result_processor(self, dialect, coltype)
+
+
 class HiveTimestamp(HiveStringTypeBase):
     """Translates timestamp strings to datetime objects"""
     impl = types.TIMESTAMP
@@ -209,7 +216,8 @@ class HiveTypeCompiler(compiler.GenericTypeCompiler):
         return 'TIMESTAMP'
 
     def visit_DATE(self, type_):
-        return 'TIMESTAMP'
+        # Hive has had a DATE type since 0.12.
+        return 'DATE'
 
     def visit_DATETIME(self, type_):
         return 'TIMESTAMP'
@@ -257,6 +265,7 @@ class HiveDialect(default.DefaultDialect):
     description_encoding = None
     supports_multivalues_insert = True
     type_compiler = HiveTypeCompiler
+    colspecs = {types.Date: HiveDateResult}
     supports_sane_rowcount = False
     supports_statement_cache = False
 
@@ -299,7 +308,9 @@ class HiveDialect(default.DefaultDialect):
             rows = connection.execute(text('DESCRIBE {}'.format(full_table))).fetchall()
         except exc.OperationalError as e:
             # Does the table exist?
-            regex_fmt = r'TExecuteStatementResp.*SemanticException.*Table not found {}'
+            # Hive 4 qualifies the name with the database even when the query did not.
+            regex_fmt = (r'TExecuteStatementResp.*SemanticException'
+                         r'.*Table not found (?:[^\s.]+\.)?{}(?!\w)')
             regex = regex_fmt.format(re.escape(full_table))
             if re.search(regex, e.args[0]):
                 raise exc.NoSuchTableError(full_table)
@@ -352,8 +363,8 @@ class HiveDialect(default.DefaultDialect):
         return []
 
     def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        # Hive has no support for primary keys.
-        return []
+        # Hive has no enforced primary keys; SQLAlchemy expects a constraint dict.
+        return {'constrained_columns': [], 'name': None}
 
     def get_indexes(self, connection, table_name, schema=None, **kw):
         rows = self._get_table_columns(connection, table_name, schema)

@@ -481,6 +481,13 @@ class Cursor(common.DBAPICursor):
         _check_status(response)
         self._operationHandle = response.operationHandle
 
+    def _discard_results(self):
+        # Statements without a result set (INSERT, DDL) have nothing to fetch, and a
+        # synchronous execute() has already waited for them to finish.
+        if self._operationHandle is not None and not self._operationHandle.hasResultSet:
+            return
+        super(Cursor, self)._discard_results()
+
     def cancel(self):
         req = ttypes.TCancelOperationReq(
             operationHandle=self._operationHandle,
