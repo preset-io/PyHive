@@ -48,7 +48,7 @@ podTemplate(
                         /tmp/unit/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=2.0,<2.1' 'pytest>=8,<9' mock packaging 'setuptools>=69.3'
                         # Offline suites only: the other pyhive/tests modules need live servers.
                         PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit/bin/python -m pytest -c /dev/null --rootdir . -q \
-                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py scripts/test_release_artifact.py
+                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py pyhive/tests/test_hive_sqlalchemy2.py scripts/test_release_artifact.py
                     ''',
                     label: 'Offline unit tests'
                 )
