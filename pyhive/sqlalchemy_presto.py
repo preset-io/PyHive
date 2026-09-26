@@ -8,7 +8,10 @@ which is released under the MIT license.
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
+import datetime
 import re
+
+import dateutil.tz
 import sqlalchemy
 from sqlalchemy import exc
 from sqlalchemy import types
@@ -49,6 +52,111 @@ _type_map = {
     'date': types.DATE,
     'varbinary': types.VARBINARY,
 }
+
+# Types whose SHOW COLUMNS spelling carries parameters or a zone qualifier.
+_TYPE_RE = re.compile(r'^([a-z ]+?)\s*(?:\(([^)]*)\))?\s*(with time zone)?$')
+
+
+def _parse_type(type_str):
+    """Return the SQLAlchemy type for a Presto type string, or None."""
+    match = _TYPE_RE.match(type_str.strip().lower())
+    if not match:
+        return None
+    name, args, with_zone = match.groups()
+    params = [p.strip() for p in args.split(',')] if args else []
+    if not all(p.isdigit() for p in params):
+        return None  # array(...), map(...), row(...) and friends
+    params = [int(p) for p in params]
+    if with_zone:
+        if name == 'timestamp':
+            return types.TIMESTAMP(timezone=True)
+        if name == 'time':
+            return types.TIME(timezone=True)
+        return None
+    if name == 'decimal' and len(params) in (0, 2):
+        return types.DECIMAL(*params)
+    if name == 'varchar' and len(params) == 1:
+        return types.VARCHAR(params[0])
+    if name == 'char' and len(params) <= 1:
+        return types.CHAR(*params)
+    if name == 'time' and not params:
+        return types.TIME()
+    if name in _type_map and not params:
+        return _type_map[name]
+    return None
+
+
+# Presto's REST protocol returns date and time values as strings, e.g.
+# '2000-02-29', '2026-09-24 12:34:56.123', '12:34:56.123 +05:30' or
+# '2026-09-24 12:34:56.123 America/New_York'.
+_DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
+_TIME_RE = re.compile(r'^(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?: (.+))?$')
+_OFFSET_RE = re.compile(r'^([+-])(\d{2}):(\d{2})$')
+
+
+def _microseconds(fraction, value):
+    if not fraction:
+        return 0
+    if len(fraction) > 6 and fraction[6:].strip('0'):
+        # datetime cannot hold it; refusing is better than silently truncating.
+        raise ValueError('Sub-microsecond precision in {!r} cannot be represented'.format(value))
+    return int(fraction[:6].ljust(6, '0'))
+
+
+def _tzinfo(zone, value):
+    if zone is None:
+        return None
+    offset = _OFFSET_RE.match(zone)
+    if offset:
+        sign, hours, minutes = offset.groups()
+        delta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+        return datetime.timezone(-delta if sign == '-' else delta)
+    tzinfo = dateutil.tz.gettz(zone)
+    if tzinfo is None:
+        raise ValueError('Unknown time zone in {!r}'.format(value))
+    return tzinfo
+
+
+def _parse_date(value):
+    match = _DATE_RE.match(value)
+    if not match:
+        raise ValueError('Invalid Presto date {!r}'.format(value))
+    return datetime.date(*map(int, match.groups()))
+
+
+def _parse_time(value):
+    match = _TIME_RE.match(value)
+    if not match:
+        raise ValueError('Invalid Presto time {!r}'.format(value))
+    hour, minute, second, fraction, zone = match.groups()
+    return datetime.time(int(hour), int(minute), int(second),
+                         _microseconds(fraction, value), _tzinfo(zone, value))
+
+
+def _parse_datetime(value):
+    day, _, clock = value.partition(' ')
+    # combine() keeps the time's tzinfo; region zones resolve per instant.
+    return datetime.datetime.combine(_parse_date(day), _parse_time(clock))
+
+
+def _string_result(parse):
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            return parse(value) if isinstance(value, str) else value
+        return process
+    return result_processor
+
+
+class PrestoDate(types.Date):
+    result_processor = _string_result(_parse_date)
+
+
+class PrestoDateTime(types.DateTime):
+    result_processor = _string_result(_parse_datetime)
+
+
+class PrestoTime(types.Time):
+    result_processor = _string_result(_parse_time)
 
 
 class PrestoCompiler(SQLCompiler):
@@ -93,7 +201,16 @@ class PrestoDialect(default.DefaultDialect):
     returns_unicode_strings = True
     description_encoding = None
     supports_native_boolean = True
+    # The DBAPI returns exact Decimal values for decimal columns and binds
+    # Decimal as a DECIMAL literal, so SQLAlchemy must not route either
+    # direction through float.
+    supports_native_decimal = True
     type_compiler = PrestoTypeCompiler
+    colspecs = {
+        types.Date: PrestoDate,
+        types.DateTime: PrestoDateTime,
+        types.Time: PrestoTime,
+    }
 
     @classmethod
     def dbapi(cls):
@@ -159,9 +276,8 @@ class PrestoDialect(default.DefaultDialect):
         rows = self._get_table_columns(connection, table_name, schema)
         result = []
         for row in rows:
-            try:
-                coltype = _type_map[row.Type]
-            except KeyError:
+            coltype = _parse_type(row.Type)
+            if coltype is None:
                 util.warn("Did not recognize type '%s' of column '%s'" % (row.Type, row.Column))
                 coltype = types.NullType
             result.append({
@@ -178,8 +294,8 @@ class PrestoDialect(default.DefaultDialect):
         return []
 
     def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        # Hive has no support for primary keys.
-        return []
+        # Presto has no primary keys; SQLAlchemy expects a constraint dict.
+        return {'constrained_columns': [], 'name': None}
 
     def get_indexes(self, connection, table_name, schema=None, **kw):
         rows = self._get_table_columns(connection, table_name, schema)
@@ -209,6 +325,21 @@ class PrestoDialect(default.DefaultDialect):
         if schema:
             query += ' FROM ' + self.identifier_preparer.quote_identifier(schema)
         return [row.Table for row in connection.execute(text(query))]
+
+    def get_view_names(self, connection, schema=None, **kw):
+        if schema is None:
+            schema = self._connection_schema(connection)
+        query = text(
+            'SELECT table_name FROM information_schema.views '
+            'WHERE table_schema = :schema ORDER BY table_name'
+        )
+        return [row[0] for row in connection.execute(query, {'schema': schema})]
+
+    def _connection_schema(self, connection):
+        """The schema the connection's queries run in (the DBAPI default is 'default')."""
+        pooled = connection.connection
+        dbapi_connection = getattr(pooled, 'dbapi_connection', None) or pooled.connection
+        return dbapi_connection._kwargs.get('schema', 'default')
 
     def do_rollback(self, dbapi_connection):
         # No transactions for Presto

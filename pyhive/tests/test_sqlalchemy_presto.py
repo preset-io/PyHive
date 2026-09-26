@@ -14,6 +14,7 @@ from sqlalchemy.types import String
 from decimal import Decimal
 
 import contextlib
+import datetime
 import mock
 import unittest
 
@@ -50,7 +51,7 @@ class TestSqlAlchemyPresto(unittest.TestCase, SqlAlchemyTestCase):
                 0.5,
                 0.25,
                 "a string",
-                "1970-01-01 00:00:00.000",
+                datetime.datetime(1970, 1, 1),  # typed TIMESTAMP column
                 b"123",
                 [1, 2],
                 {
@@ -77,7 +78,11 @@ class TestSqlAlchemyPresto(unittest.TestCase, SqlAlchemyTestCase):
         self.assertIsInstance(one_row_complex.c.array.type, types.NullType)
         self.assertIsInstance(one_row_complex.c.map.type, types.NullType)
         self.assertIsInstance(one_row_complex.c.struct.type, types.NullType)
-        self.assertIsInstance(one_row_complex.c.decimal.type, types.NullType)
+        self.assertIsInstance(one_row_complex.c.decimal.type, types.DECIMAL)
+        self.assertEqual(
+            (one_row_complex.c.decimal.type.precision, one_row_complex.c.decimal.type.scale),
+            (10, 1),
+        )
 
     def test_url_default(self):
         engine = create_engine("presto://localhost:8080/hive")
