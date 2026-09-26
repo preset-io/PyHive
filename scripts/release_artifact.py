@@ -6,7 +6,9 @@ parts of an sdist filename (PEP 625: the project name as in PEP 503 with runs of
 ``-_.`` collapsed to ``_`` and lowercased; the version as in PEP 440), so
 ``PyHive`` 0.7.0.3 is built as ``pyhive-0.7.0.3.tar.gz``. Deriving the key from
 the unnormalized project name makes the existence check look for an object that
-can never exist.
+can never exist. setuptools applies PEP 625 from 69.3 on, so CI requires at
+least that version, and the packaging step fails if the built file has any
+other name.
 
 Usage:
     python scripts/release_artifact.py version <base-version> <branch> <revision>

@@ -40,12 +40,12 @@ podTemplate(
             }
 
             stage('Tests') {
-                sh(script: 'pip install -e . && pip install -r dev_requirements.txt && pip install packaging', label: 'install dependencies')
+                sh(script: "pip install -e . && pip install -r dev_requirements.txt && pip install packaging 'setuptools>=69.3'", label: 'install dependencies')
                 sh(
                     script: '''
                         set -eu
                         python -m venv /tmp/unit
-                        /tmp/unit/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=2.0,<2.1' 'pytest>=8,<9' mock packaging
+                        /tmp/unit/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=2.0,<2.1' 'pytest>=8,<9' mock packaging 'setuptools>=69.3'
                         # Offline suites only: the other pyhive/tests modules need live servers.
                         PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit/bin/python -m pytest -c /dev/null --rootdir . -q \
                             pyhive/tests/test_common.py pyhive/tests/test_presto_types.py scripts/test_release_artifact.py
