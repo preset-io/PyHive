@@ -329,3 +329,70 @@ def test_table_comment_view_definition_and_constraints():
 def test_tinyint_compiles():
     from sqlalchemy.dialects.mysql import TINYINT
     assert TINYINT().compile(dialect=HiveDialect()) == 'TINYINT'
+
+
+# KERBEROS through python-gssapi when pure-sasl has no kerberos backend.
+
+class FakeGSSContext(object):
+    """Scripted initiator: two context tokens, then the RFC 4752 layer exchange."""
+
+    def __init__(self, offer=b'\x01\x00\x10\x00'):
+        self.complete = False
+        self.steps = []
+        self.offer = offer
+
+    def step(self, token=None):
+        self.steps.append(token)
+        if token is None:
+            return b'initial'
+        self.complete = True
+        return None
+
+    def unwrap(self, message):
+        assert message == b'wrapped-offer'
+        return collections.namedtuple('Unwrapped', 'message')(self.offer)
+
+    def wrap(self, message, encrypt):
+        assert encrypt is False
+        return collections.namedtuple('Wrapped', 'message')(b'wrapped:' + message)
+
+
+def gssapi_client(context):
+    from pyhive.sasl_compat import GSSAPIClient
+    client = GSSAPIClient.__new__(GSSAPIClient)
+    client.error = None
+    client._context = context
+    return client
+
+
+def test_gssapi_client_handshake():
+    client = gssapi_client(FakeGSSContext())
+    assert client.start('GSSAPI') == (True, 'GSSAPI', b'initial')
+    assert client.step(b'server-token') == (True, b'')
+    # "no security layer", maximum size 0, no authorization id
+    assert client.step(b'wrapped-offer') == (True, b'wrapped:\x01\x00\x00\x00')
+    assert client.encode(b'x') == (True, b'x') and client.decode(b'y') == (True, b'y')
+
+
+def test_gssapi_client_rejects_servers_without_the_auth_layer():
+    client = gssapi_client(FakeGSSContext(offer=b'\x04\x00\x10\x00'))
+    client.start('GSSAPI')
+    client.step(b'server-token')
+    assert client.step(b'wrapped-offer') == (False, None)
+    assert 'quality of protection' in client.getError()
+
+
+def test_gssapi_is_used_only_without_pure_sasl_kerberos(monkeypatch):
+    from pyhive import sasl_compat
+    created = []
+    monkeypatch.setattr(sasl_compat, 'GSSAPIClient',
+                        lambda **kw: created.append(kw) or 'gssapi-client')
+    monkeypatch.setattr(hive, '_has_gssapi', lambda: True)
+    monkeypatch.setattr(hive, '_pure_sasl_has_kerberos', lambda: False)
+    assert hive.get_pure_sasl_client('h', 'GSSAPI', service='hive') == 'gssapi-client'
+    assert created == [{'host': 'h', 'service': 'hive'}]
+    monkeypatch.setattr(hive, '_pure_sasl_has_kerberos', lambda: True)
+    assert hive.get_pure_sasl_client('h', 'GSSAPI', service='hive') != 'gssapi-client'
+    # PLAIN never uses it
+    monkeypatch.setattr(hive, '_pure_sasl_has_kerberos', lambda: False)
+    assert hive.get_pure_sasl_client('h', 'PLAIN', username='u', password='p') != 'gssapi-client'

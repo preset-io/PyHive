@@ -54,3 +54,61 @@ class PureSASLClient(SASLClient):
 
     def getError(self):
         return self.error
+
+
+class GSSAPIClient(object):
+    """SASL GSSAPI (Kerberos V5, RFC 4752) client on top of python-gssapi.
+
+    pure-sasl implements GSSAPI only through the ``kerberos`` (pykerberos) module. This
+    client lets KERBEROS authentication work where only ``gssapi`` is installed. It
+    negotiates the ``auth`` quality of protection (no integrity or confidentiality
+    layer), which is HiveServer2's default ``hive.server2.thrift.sasl.qop``.
+    """
+
+    _NO_SECURITY_LAYER = 1
+
+    def __init__(self, host, service, **kwargs):
+        import gssapi
+
+        self._gssapi = gssapi
+        self.error = None
+        name = gssapi.Name('{}@{}'.format(service, host), gssapi.NameType.hostbased_service)
+        self._context = gssapi.SecurityContext(
+            name=name, usage='initiate',
+            flags=[gssapi.RequirementFlag.mutual_authentication,
+                   gssapi.RequirementFlag.out_of_sequence_detection])
+
+    def _call(self, fn, *args):
+        self.error = None
+        try:
+            return True, fn(*args)
+        except Exception as e:  # reported through getError(), like python-sasl
+            self.error = str(e)
+            return False, None
+
+    def start(self, mechanism):
+        ok, token = self._call(self._context.step)
+        return ok, 'GSSAPI', token
+
+    def step(self, challenge=None):
+        if not self._context.complete:
+            return self._call(lambda: self._context.step(challenge) or b'')
+        return self._call(self._negotiate_layer, challenge)
+
+    def _negotiate_layer(self, challenge):
+        # The server offers its security layers and maximum buffer size in a wrapped
+        # 4-byte message; answer "no security layer", size 0, no authorization id.
+        offer = bytearray(self._context.unwrap(challenge).message)
+        if len(offer) != 4 or not offer[0] & self._NO_SECURITY_LAYER:
+            raise ValueError('server does not offer the "auth" quality of protection')
+        answer = bytes(bytearray([self._NO_SECURITY_LAYER, 0, 0, 0]))
+        return self._context.wrap(answer, False).message
+
+    def encode(self, outgoing):
+        return True, outgoing
+
+    def decode(self, incoming):
+        return True, incoming
+
+    def getError(self):
+        return self.error

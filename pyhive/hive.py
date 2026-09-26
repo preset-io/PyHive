@@ -71,6 +71,9 @@ def get_sasl_client(host, sasl_auth, service=None, username=None, password=None)
 def get_pure_sasl_client(host, sasl_auth, service=None, username=None, password=None):
     from pyhive.sasl_compat import PureSASLClient
 
+    if sasl_auth == 'GSSAPI' and not _pure_sasl_has_kerberos() and _has_gssapi():
+        from pyhive.sasl_compat import GSSAPIClient
+        return GSSAPIClient(host=host, service=service)
     if sasl_auth == 'GSSAPI':
         sasl_kwargs = {'service': service}
     elif sasl_auth == 'PLAIN':
@@ -79,6 +82,19 @@ def get_pure_sasl_client(host, sasl_auth, service=None, username=None, password=
         raise ValueError("sasl_auth only supports GSSAPI and PLAIN")
 
     return PureSASLClient(host=host, **sasl_kwargs)
+
+
+def _pure_sasl_has_kerberos():
+    from puresasl import mechanisms
+    return bool(getattr(mechanisms, 'have_kerberos', False))
+
+
+def _has_gssapi():
+    try:
+        import gssapi  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def get_installed_sasl(host, sasl_auth, service=None, username=None, password=None):
