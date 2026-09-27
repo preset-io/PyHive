@@ -539,3 +539,67 @@ def test_gssapi_is_used_only_without_pure_sasl_kerberos(monkeypatch):
     # PLAIN never uses it
     monkeypatch.setattr(hive, '_pure_sasl_has_kerberos', lambda: False)
     assert hive.get_pure_sasl_client('h', 'PLAIN', username='u', password='p') != 'gssapi-client'
+
+
+# Result types: Numeric, dates, zoned timestamps, newer Thrift type ids.
+
+def _result(type_, value):
+    processor = type_.dialect_impl(HiveDialect()).result_processor(HiveDialect(), None)
+    return processor(value) if processor else value
+
+
+@pytest.mark.parametrize('type_,value,expected', [
+    (sa.Numeric(10, 2), 1.1, Decimal('1.10')),        # DOUBLE result
+    (sa.Numeric(), 1.1, Decimal('1.1000000000')),
+    (sa.Numeric(10, 2, decimal_return_scale=4), 1.1, Decimal('1.1000')),
+    (sa.Numeric(20, 2), 9223372036854775807, Decimal('9223372036854775807.00')),  # BIGINT
+    (sa.Numeric(10, 0), -5, Decimal('-5')),
+    (sa.Numeric(38, 18), Decimal('1.000000000000000001'), Decimal('1.000000000000000001')),
+    (sa.Numeric(10, 2, asdecimal=False), Decimal('1.25'), 1.25),
+    (sa.Float(), 1.1, 1.1),
+])
+def test_numeric_results(type_, value, expected):
+    got = _result(type_, value)
+    assert got == expected and type(got) is type(expected)
+
+
+@pytest.mark.parametrize('value', ['0000-01-01', '-0001-01-01', '+10000-01-01', '2024-02-30'])
+def test_dates_date_cannot_hold_raise(value):
+    with pytest.raises(hive.DataError):
+        _result(sa.Date(), value)
+
+
+def test_valid_dates_parse():
+    assert _result(sa.Date(), '0001-01-01') == datetime.date(1, 1, 1)
+    assert _result(sa.Date(), '9999-12-31') == datetime.date(9999, 12, 31)
+
+
+@pytest.mark.parametrize('value', ['0000-01-01 00:00:00', '-0001-01-01 00:00:00'])
+def test_timestamps_datetime_cannot_hold_raise(value):
+    with pytest.raises(hive.DataError):
+        hive._parse_timestamp(value)
+
+
+def test_zoned_timestamps():
+    got = _result(sa.DateTime(timezone=True), '2024-07-01 12:00:00.0 America/New_York')
+    assert got == datetime.datetime(2024, 7, 1, 16, 0, tzinfo=datetime.timezone.utc)
+    assert got.tzinfo is not None
+    # plain TIMESTAMP values already arrive as datetime and pass through
+    naive = datetime.datetime(2024, 1, 1)
+    assert _result(sa.DateTime(), naive) is naive
+
+
+@pytest.mark.parametrize('value,message', [
+    ('2024-11-03 01:30:00.0 America/New_York', 'Ambiguous'),
+    ('2024-03-10 02:30:00.0 America/New_York', 'Nonexistent'),
+    ('2024-07-01 12:00:00.0 Not/AZone', 'Unknown time zone'),
+])
+def test_zoned_timestamps_that_cannot_be_resolved_raise(value, message):
+    with pytest.raises(hive.DataError, match=message):
+        _result(sa.DateTime(timezone=True), value)
+
+
+def test_newer_thrift_type_ids_do_not_crash():
+    assert hive._type_name(ttypes.TTypeId.TIMESTAMP_TYPE) == 'TIMESTAMP_TYPE'
+    assert hive._type_name(22) == 'TIMESTAMPLOCALTZ_TYPE'
+    assert hive._type_name(999) == 'STRING_TYPE'

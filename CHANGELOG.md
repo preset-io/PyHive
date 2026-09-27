@@ -33,6 +33,14 @@ Changes:
   (the requests exception is its ``__cause__``) instead of a raw
   ``requests.exceptions.ConnectionError``; ``PrestoDialect.is_disconnect``
   recognises it.
+- Hive SQLAlchemy dialect: ``Numeric`` over DOUBLE/FLOAT/integer results returns
+  ``Decimal`` (``Float`` stays ``float``); typed DATE/TIMESTAMP values ``datetime`` cannot
+  hold (year 0, negative years) raise ``DataError`` instead of being misread or raising
+  ``ValueError``; typed ``DateTime`` reads of TIMESTAMP WITH LOCAL TIME ZONE return aware
+  datetimes, and ambiguous (DST fall-back), nonexistent or unknown-zone values raise
+  ``DataError``.
+- Hive DB-API: result columns of a type id newer than the bundled Thrift definitions
+  (TIMESTAMP WITH LOCAL TIME ZONE, id 22) no longer fail with ``KeyError``.
 - Hive SQLAlchemy dialect: ``is_disconnect`` recognises lost connections, so
   ``pool_pre_ping`` and pool invalidation work after a server restart;
   ``get_table_names`` no longer lists views and ``get_view_names`` lists only

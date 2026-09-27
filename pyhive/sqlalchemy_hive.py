@@ -36,8 +36,50 @@ from sqlalchemy.sql.compiler import SQLCompiler
 from pyhive import hive
 from pyhive.common import UniversalSet
 
-from dateutil.parser import parse
+import dateutil.tz
 from decimal import Decimal
+
+
+_DATE_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
+_ZONED_TIMESTAMP_PATTERN = re.compile(r'^(\d+-\d+-\d+ \d+:\d+:\d+(?:\.\d+)?) (\S+)$')
+
+
+def _parse_date(value):
+    """A Hive DATE string ('YYYY-MM-DD') as a ``date``.
+
+    Values ``date`` cannot hold (year 0, negative years, years past 9999) raise
+    ``DataError`` instead of being misread.
+    """
+    match = _DATE_PATTERN.match(value.strip())
+    if match:
+        try:
+            return datetime.date(*(int(part) for part in match.groups()))
+        except ValueError as e:
+            raise hive.DataError('Invalid or out-of-range Hive DATE {!r}: {}'.format(value, e))
+    raise hive.DataError('Invalid or out-of-range Hive DATE {!r}'.format(value))
+
+
+def _parse_timestamp_text(value):
+    """A TIMESTAMP or TIMESTAMP WITH LOCAL TIME ZONE string as a ``datetime``.
+
+    A value with a zone ('2024-07-01 12:00:00.0 America/New_York') becomes an aware
+    ``datetime``. Local times that are ambiguous (DST fall-back) or nonexistent
+    (spring-forward gap) in that zone, and unknown zones, raise ``DataError`` rather than
+    silently resolving to one of the candidate instants.
+    """
+    match = _ZONED_TIMESTAMP_PATTERN.match(value.strip())
+    if not match:
+        return hive._parse_timestamp(value)
+    local, zone_name = match.groups()
+    zone = dateutil.tz.gettz(zone_name)
+    if zone is None:
+        raise hive.DataError('Unknown time zone in {!r}'.format(value))
+    result = hive._parse_timestamp(local).replace(tzinfo=zone)
+    if not dateutil.tz.datetime_exists(result):
+        raise hive.DataError('Nonexistent local time (DST gap) in {!r}'.format(value))
+    if dateutil.tz.datetime_ambiguous(result):
+        raise hive.DataError('Ambiguous local time (DST fall-back) in {!r}'.format(value))
+    return result
 
 
 class HiveStringTypeBase(types.TypeDecorator):
@@ -64,7 +106,7 @@ class HiveDate(HiveStringTypeBase):
             elif isinstance(value, datetime.date):
                 return value
             elif value is not None:
-                return parse(value).date()
+                return _parse_date(value)
             else:
                 return None
 
@@ -93,7 +135,7 @@ class HiveTimestamp(HiveStringTypeBase):
             if isinstance(value, datetime.datetime):
                 return value
             elif value is not None:
-                return parse(value)
+                return _parse_timestamp_text(value)
             else:
                 return None
 
@@ -129,22 +171,48 @@ class HiveDecimal(HiveStringTypeBase):
 
 
 class HiveNumeric(types.DECIMAL):
-    """DECIMAL(p, s) as reflected from Hive.
+    """DECIMAL(p, s) as reflected from Hive, and the result type of ``Numeric``.
 
-    The DB-API already returns ``Decimal`` for DECIMAL columns; strings are converted too so
-    values are exact whichever way the column is read.
+    The DB-API returns ``Decimal`` for DECIMAL columns (kept exact), ``float`` for
+    DOUBLE/FLOAT and ``int`` for integer types. ``Numeric`` must return ``Decimal`` whatever
+    the column's type, so floats are converted the way SQLAlchemy's to_decimal processor does
+    (``decimal_return_scale``/``scale``) and integers exactly.
     """
 
     def result_processor(self, dialect, coltype):
-        as_decimal = self.asdecimal
+        if not self.asdecimal:
+            def to_float(value):
+                if value is None or isinstance(value, bool):
+                    return value
+                return float(value)
+            return to_float
+        scale = self._effective_decimal_return_scale
+        fmt = '%.{:d}f'.format(scale)
 
         def process(value):
-            if value is None:
-                return None
-            if not isinstance(value, Decimal):
-                value = Decimal(value)
-            return value if as_decimal else float(value)
+            if value is None or isinstance(value, bool):
+                return value
+            if isinstance(value, Decimal):
+                return value
+            if isinstance(value, float):
+                return Decimal(fmt % value)
+            if isinstance(value, int):
+                # Exact: formatting through float would lose digits.
+                return Decimal('{}.{}'.format(value, '0' * scale)) if scale else Decimal(value)
+            return Decimal(value)
 
+        return process
+
+
+class HiveDateTimeResult(types.DateTime):
+    """Plain DateTime columns: TIMESTAMP arrives as ``datetime`` from the DB-API, TIMESTAMP
+    WITH LOCAL TIME ZONE as text with a zone."""
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None or isinstance(value, datetime.datetime):
+                return value
+            return _parse_timestamp_text(value)
         return process
 
 
@@ -370,7 +438,13 @@ class HiveDialect(default.DefaultDialect):
     description_encoding = None
     supports_multivalues_insert = True
     type_compiler = HiveTypeCompiler
-    colspecs = {types.Date: HiveDateResult}
+    colspecs = {
+        types.Date: HiveDateResult,
+        types.DateTime: HiveDateTimeResult,
+        types.Numeric: HiveNumeric,
+        # Float subclasses Numeric; keep SQLAlchemy's float handling for it.
+        types.Float: types.Float,
+    }
     supports_sane_rowcount = False
     supports_statement_cache = False
 

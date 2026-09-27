@@ -446,7 +446,8 @@ def test_hive_and_common_escaping_is_unchanged(escaper):
 
 
 def test_hive_dialect_does_not_pick_up_presto_types():
-    presto_types = set(PrestoDialect.colspecs.values())
+    # Both map Float to SQLAlchemy's own Float; no pyhive Presto type may leak into Hive.
+    presto_types = {t for t in PrestoDialect.colspecs.values() if t.__module__.startswith('pyhive')}
     assert not issubclass(HiveDialect, PrestoDialect)
     assert not presto_types & set(HiveDialect.colspecs.values())
 

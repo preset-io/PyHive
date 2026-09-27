@@ -138,13 +138,28 @@ def _parse_timestamp(value, strict=False):
                 value = match.group()
             else:
                 format = '%Y-%m-%d %H:%M:%S'
-            value = datetime.datetime.strptime(value, format)
+            try:
+                value = datetime.datetime.strptime(value, format)
+            except ValueError as e:  # e.g. year 0 or 10000
+                raise DataError('Invalid or out-of-range Hive TIMESTAMP {!r}: {}'.format(value, e))
         else:
-            raise Exception(
+            raise DataError(
                 'Cannot convert "{}" into a datetime'.format(value))
     else:
         value = None
     return value
+
+
+# Type ids newer than the bundled Thrift definitions (protocol V6 lists up to 21).
+_EXTRA_TYPE_NAMES = {22: 'TIMESTAMPLOCALTZ_TYPE'}
+
+
+def _type_name(type_id):
+    """Name of a Thrift type id; ids this module does not know are read as strings."""
+    name = ttypes.TTypeId._VALUES_TO_NAMES.get(type_id) or _EXTRA_TYPE_NAMES.get(type_id)
+    if name is None:
+        return ttypes.TTypeId._VALUES_TO_NAMES[ttypes.TTypeId.STRING_TYPE]
+    return name
 
 
 def _as_bool(value):
@@ -567,7 +582,7 @@ class Cursor(common.DBAPICursor):
                     type_code = ttypes.TTypeId._VALUES_TO_NAMES[ttypes.TTypeId.STRING_TYPE]
                 else:
                     type_id = primary_type_entry.primitiveEntry.type
-                    type_code = ttypes.TTypeId._VALUES_TO_NAMES[type_id]
+                    type_code = _type_name(type_id)
                 self._description.append((
                     col.columnName.decode('utf-8') if sys.version_info[0] == 2 else col.columnName,
                     type_code.decode('utf-8') if sys.version_info[0] == 2 else type_code,
