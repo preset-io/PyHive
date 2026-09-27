@@ -23,9 +23,14 @@ from packaging.version import Version
 
 
 def release_version(base, branch, revision):
-    """Return the version to build: the base version, or a PR-local version."""
+    """Return the version to build: the base version, or a PR-local version.
+
+    The revision gets a ``g`` prefix (as in ``git describe``): PEP 440 drops
+    leading zeros from all-numeric local segments, so ``0123456`` would
+    otherwise become ``123456`` and no longer match ``git rev-parse --short``.
+    """
     if branch.startswith('PR-'):
-        return str(Version('{}+{}.{}'.format(base, branch, revision)))
+        return str(Version('{}+{}.g{}'.format(base, branch, revision)))
     return str(Version(base))
 
 
