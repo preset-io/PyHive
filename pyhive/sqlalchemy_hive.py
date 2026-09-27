@@ -196,6 +196,27 @@ def _parse_type(col_type):
     return coltype()
 
 
+_JAVA_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|[tnrbf"\'\\])')
+_JAVA_ESCAPES = {'t': '\t', 'n': '\n', 'r': '\r', 'b': '\b', 'f': '\f',
+                 '"': '"', "'": "'", '\\': '\\'}
+
+
+def _unescape_comment(comment):
+    """Undo Hive's Java escaping of comments; ``from deserializer`` means no comment."""
+    if not comment or comment == 'from deserializer':
+        return None
+
+    def unescape(match):
+        code = match.group(1)
+        if code.startswith('u'):
+            return chr(int(code[1:], 16))
+        return _JAVA_ESCAPES[code]
+
+    text = _JAVA_ESCAPE.sub(unescape, comment)
+    # Characters outside the BMP arrive as a \uXXXX surrogate pair.
+    return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+
+
 class HiveIdentifierPreparer(compiler.IdentifierPreparer):
     # Just quote everything to make things simpler / easier to upgrade
     reserved_words = UniversalSet()
@@ -214,7 +235,8 @@ _type_map = {
     'int': types.Integer,
     'bigint': types.BigInteger,
     'float': types.Float,
-    'double': types.DOUBLE,
+    # types.DOUBLE is new in SQLAlchemy 2.0; 1.x reflected DOUBLE as Float.
+    'double': getattr(types, 'DOUBLE', None) or types.Float,
     'string': types.String,
     'varchar': types.String,
     'char': types.String,
@@ -389,12 +411,19 @@ class HiveDialect(default.DefaultDialect):
                 index = i
         return [row[index] for row in result]
 
+    # Parse errors from Hive (< 2.2) and Spark Thrift Server for a SHOW VIEWS they lack.
+    _SHOW_VIEWS_UNSUPPORTED = re.compile(
+        r'ParseException|cannot recognize input|mismatched input|no viable alternative')
+
     def _view_names(self, connection, schema):
         """View names, or None when the server has no SHOW VIEWS (Hive < 2.2)."""
         try:
             return self._show_names(connection, 'VIEWS', schema)
-        except exc.OperationalError:
-            return None
+        except exc.OperationalError as e:
+            # Anything else (authorization, lost connection, ...) is a real error.
+            if self._SHOW_VIEWS_UNSUPPORTED.search(str(getattr(e, 'orig', None) or e)):
+                return None
+            raise
 
     def get_view_names(self, connection, schema=None, **kw):
         views = self._view_names(connection, schema)
@@ -459,16 +488,20 @@ class HiveDialect(default.DefaultDialect):
                 'type': coltype,
                 'nullable': True,
                 'default': None,
-                'comment': _comment or None,
+                'comment': _unescape_comment(_comment),
             })
         return result
 
-    def _describe_formatted(self, connection, table_name, schema):
+    def _describe_formatted_rows(self, connection, table_name, schema):
         full_table = table_name
         if schema:
             full_table = schema + '.' + table_name
+        # Same unquoted name as DESCRIBE, which has just accepted it.
         self._get_table_columns(connection, table_name, schema)  # NoSuchTableError
-        rows = connection.execute(text('DESCRIBE FORMATTED {}'.format(full_table))).fetchall()
+        return connection.execute(text('DESCRIBE FORMATTED {}'.format(full_table))).fetchall()
+
+    def _describe_formatted(self, connection, table_name, schema):
+        rows = self._describe_formatted_rows(connection, table_name, schema)
         return [tuple(col.strip() if col else col for col in row) for row in rows]
 
     def get_table_comment(self, connection, table_name, schema=None, **kw):
@@ -479,14 +512,23 @@ class HiveDialect(default.DefaultDialect):
             elif in_params and key:
                 break
             elif in_params and name == 'comment':
-                return {'text': value}
+                return {'text': _unescape_comment(value)}
         return {'text': None}
 
     def get_view_definition(self, connection, view_name, schema=None, **kw):
-        for key, value, _ in self._describe_formatted(connection, view_name, schema):
+        rows = self._describe_formatted_rows(connection, view_name, schema)
+        for i, (key, value, _) in enumerate(rows):
             # Hive 4 labels it "Original Query:", Hive 2/3 "View Original Text:".
-            if key in ('Original Query:', 'View Original Text:'):
-                return value
+            if (key or '').strip() not in ('Original Query:', 'View Original Text:'):
+                continue
+            # Each further line of the query comes as a row ('', <padding>, '<line>').
+            # Only rstrip: leading whitespace is the query's own indentation.
+            lines = [(value or '').rstrip()]
+            for next_key, _, line in rows[i + 1:]:
+                if (next_key or '').strip() or line is None:
+                    break
+                lines.append(line.rstrip())
+            return '\n'.join(lines).rstrip('\n')
         raise exc.NoSuchTableError(view_name)
 
     def get_unique_constraints(self, connection, table_name, schema=None, **kw):
