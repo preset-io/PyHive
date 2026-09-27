@@ -8,6 +8,8 @@ from sqlalchemy.sql import text
 from sqlalchemy import types
 from decimal import Decimal
 
+import datetime
+
 import unittest
 import contextlib
 
@@ -40,7 +42,7 @@ class TestSqlAlchemyTrino(unittest.TestCase, SqlAlchemyTestCase):
             0.5,
             0.25,
             'a string',
-            '1970-01-01 00:00:00.000',
+            datetime.datetime(1970, 1, 1),  # typed timestamp(3) column
             b'123',
             [1, 2],
             {"1": 2, "3": 4},
@@ -56,12 +58,12 @@ class TestSqlAlchemyTrino(unittest.TestCase, SqlAlchemyTestCase):
         self.assertIsInstance(one_row_complex.c.float.type, types.Float)
         self.assertIsInstance(one_row_complex.c.double.type, types.Float)
         self.assertIsInstance(one_row_complex.c.string.type, String)
-        self.assertIsInstance(one_row_complex.c.timestamp.type, types.NullType)
+        self.assertIsInstance(one_row_complex.c.timestamp.type, types.TIMESTAMP)
         self.assertIsInstance(one_row_complex.c.binary.type, types.VARBINARY)
         self.assertIsInstance(one_row_complex.c.array.type, types.NullType)
         self.assertIsInstance(one_row_complex.c.map.type, types.NullType)
         self.assertIsInstance(one_row_complex.c.struct.type, types.NullType)
-        self.assertIsInstance(one_row_complex.c.decimal.type, types.NullType)
+        self.assertIsInstance(one_row_complex.c.decimal.type, types.DECIMAL)
     
     @with_engine_connection
     def test_reflect_no_such_table(self, engine, connection):
