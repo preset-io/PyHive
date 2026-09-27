@@ -59,7 +59,7 @@ podTemplate(
                         /tmp/unit14/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=1.4,<2.0' 'pytest>=8,<9' mock
                         # setup.py allows sqlalchemy>=1.3; keep the 1.4 line honest.
                         PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit14/bin/python -m pytest -c /dev/null --rootdir . -q \
-                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py
+                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py pyhive/tests/test_hive_sqlalchemy2.py
                     ''',
                     label: 'Offline unit tests (SQLAlchemy 1.4)'
                 )
