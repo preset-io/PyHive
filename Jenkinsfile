@@ -50,7 +50,18 @@ podTemplate(
                         PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit/bin/python -m pytest -c /dev/null --rootdir . -q \
                             pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py pyhive/tests/test_hive_sqlalchemy2.py scripts/test_release_artifact.py
                     ''',
-                    label: 'Offline unit tests'
+                    label: 'Offline unit tests (SQLAlchemy 2.0)'
+                )
+                sh(
+                    script: '''
+                        set -eu
+                        python -m venv /tmp/unit14
+                        /tmp/unit14/bin/pip install --quiet -e '.[presto,sqlalchemy,hive_pure_sasl]' 'sqlalchemy>=1.4,<2.0' 'pytest>=8,<9' mock
+                        # setup.py allows sqlalchemy>=1.3; keep the 1.4 line honest.
+                        PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/unit14/bin/python -m pytest -c /dev/null --rootdir . -q \
+                            pyhive/tests/test_common.py pyhive/tests/test_presto_types.py pyhive/tests/test_hive_offline.py
+                    ''',
+                    label: 'Offline unit tests (SQLAlchemy 1.4)'
                 )
                 parallel(
                     check: {
@@ -64,6 +75,13 @@ podTemplate(
                                 returnStdout: true,
                                 label: 'Get normalized release filename'
                         ).trim()
+                        // Only master publishes a release version. PR builds publish
+                        // <version>+pr.<n>.g<rev>, which can never collide with a release,
+                        // so the gate would only block PRs that don't bump the version.
+                        if (env.BRANCH_NAME != 'master') {
+                            echo "Skipping the existing-version check on ${env.BRANCH_NAME}"
+                            return
+                        }
                         container('ci') {
                             withCredentials([
                                 [
