@@ -13,6 +13,10 @@
 - Hive DB-API: ``auth='KERBEROS'`` works without the ``kerberos`` (pykerberos)
   module: when pure-sasl has no Kerberos backend, SASL GSSAPI runs on
   python-gssapi (``auth`` quality of protection).
+- Presto DB-API: a refused, reset or timed-out request raises ``OperationalError``
+  (the requests exception is its ``__cause__``) instead of a raw
+  ``requests.exceptions.ConnectionError``; ``PrestoDialect.is_disconnect``
+  recognises it.
 - Hive SQLAlchemy dialect: ``is_disconnect`` recognises lost connections, so
   ``pool_pre_ping`` and pool invalidation work after a server restart;
   ``get_table_names`` no longer lists views and ``get_view_names`` lists only
