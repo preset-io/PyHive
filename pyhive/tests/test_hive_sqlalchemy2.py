@@ -21,6 +21,8 @@ from pyhive import hive
 from pyhive.sqlalchemy_hive import HiveComplexType, HiveDialect, HiveNumeric
 from TCLIService import ttypes
 
+# SQLAlchemy 1.x has no DOUBLE type; the dialect reflects double as Float there.
+DOUBLE = getattr(sa, 'DOUBLE', None)
 OK = ttypes.TStatus(statusCode=ttypes.TStatusCode.SUCCESS_STATUS)
 ESC = hive.HiveParamEscaper()
 
@@ -32,9 +34,13 @@ ESC = hive.HiveParamEscaper()
      '12345678901234567890.123456789012345678BD'),
     (Decimal('-1E-18'), '-0.000000000000000001BD'),
     (Decimal('1E+3'), '1000BD'),
-    (0.1, '0.1D'),
-    (1e300, '1e+300D'),
-    (-2.25, '-2.25D'),
+    (0.1, 'CAST(0.1 AS DOUBLE)'),
+    (1e300, 'CAST(1e+300 AS DOUBLE)'),
+    (-2.25, 'CAST(-2.25 AS DOUBLE)'),
+    (5e-324, 'CAST(5e-324 AS DOUBLE)'),
+    (Decimal('-1E-38'), '-0.00000000000000000000000000000000000001BD'),
+    (Decimal('1E+37'), '1' + '0' * 37 + 'BD'),
+    (Decimal('1.' + '0' * 40), '1BD'),
     (float('nan'), "CAST('NaN' AS DOUBLE)"),
     (float('inf'), "CAST('Infinity' AS DOUBLE)"),
     (float('-inf'), "CAST('-Infinity' AS DOUBLE)"),
@@ -56,6 +62,25 @@ def test_escape_item(value, expected):
 def test_non_finite_decimals_are_rejected(value):
     with pytest.raises(hive.ProgrammingError):
         ESC.escape_item(value)
+
+
+@pytest.mark.parametrize('value', [Decimal('1E+50'), Decimal('1E-40'), Decimal('1' * 39)])
+def test_decimals_hive_cannot_hold_are_rejected(value):
+    # Hive would return NULL (1E+50) or round to 0 (1E-40).
+    with pytest.raises(hive.ProgrammingError, match='38 digits'):
+        ESC.escape_item(value)
+
+
+class ReprFloat(float):
+    # numpy >= 2 float64: repr() is 'np.float64(0.1)'
+    def __repr__(self):
+        return 'np.float64({})'.format(float.__repr__(self))
+
+
+def test_float_subclasses_render_as_plain_floats():
+    assert ESC.escape_item(ReprFloat(0.1)) == 'CAST(0.1 AS DOUBLE)'
+    np = pytest.importorskip('numpy')
+    assert ESC.escape_item(np.float64(0.1)) == 'CAST(0.1 AS DOUBLE)'
 
 
 def test_aware_datetimes_are_rejected():
@@ -82,9 +107,73 @@ def test_timestamps_parse_exactly(raw, expected):
     assert hive._parse_timestamp(raw) == expected
 
 
-def test_nanosecond_timestamps_are_not_truncated():
+NANOS = '2024-01-01 10:00:00.123456789'
+
+
+def test_nanosecond_timestamps_are_truncated_by_default(monkeypatch, caplog):
+    monkeypatch.setattr(hive, '_warned_truncated_timestamp', False)
+    with caplog.at_level('WARNING', logger='pyhive.hive'):
+        assert hive._parse_timestamp(NANOS) == datetime.datetime(2024, 1, 1, 10, 0, 0, 123456)
+        hive._parse_timestamp('2024-01-01 10:00:00.000000001')
+    # warned once, not per value
+    assert [r.getMessage() for r in caplog.records if 'Truncating' in r.getMessage()] == [
+        'Truncating TIMESTAMP "{}" to microseconds; pass strict_timestamps=True to raise '
+        'DataError instead (this warning is logged once)'.format(NANOS)]
+
+
+def test_strict_timestamps_refuse_to_truncate():
     with pytest.raises(hive.DataError):
-        hive._parse_timestamp('2024-01-01 10:00:00.123456789')
+        hive._parse_timestamp(NANOS, strict=True)
+    assert hive._parse_timestamp('2024-01-01 10:00:00.123456000', strict=True) == \
+        datetime.datetime(2024, 1, 1, 10, 0, 0, 123456)
+
+
+class FetchClient(object):
+    """Serves one TIMESTAMP column, then an empty batch."""
+
+    def __init__(self, values):
+        self.batches = [values, []]
+
+    def ExecuteStatement(self, req):
+        return Response(operationHandle=ttypes.TOperationHandle(hasResultSet=True))
+
+    def GetResultSetMetadata(self, req):
+        type_desc = ttypes.TTypeDesc(types=[ttypes.TTypeEntry(
+            primitiveEntry=ttypes.TPrimitiveTypeEntry(type=ttypes.TTypeId.TIMESTAMP_TYPE))])
+        return Response(schema=ttypes.TTableSchema(
+            columns=[ttypes.TColumnDesc(columnName='ts', typeDesc=type_desc, position=1)]))
+
+    def FetchResults(self, req):
+        values = self.batches.pop(0)
+        column = ttypes.TColumn(stringVal=ttypes.TStringColumn(values=values, nulls=b''))
+        return Response(results=ttypes.TRowSet(startRowOffset=0, rows=[], columns=[column]))
+
+    def CloseOperation(self, req):
+        return Response()
+
+
+def test_strict_timestamps_option_on_connection_and_cursor():
+    conn = FakeConnection(FetchClient([NANOS]))
+    cur = hive.Cursor(conn)
+    assert cur.strict_timestamps is False
+    cur.execute('SELECT ts')
+    assert cur.fetchall() == [(datetime.datetime(2024, 1, 1, 10, 0, 0, 123456),)]
+
+    conn = FakeConnection(FetchClient([NANOS]))
+    conn.strict_timestamps = True
+    cur = hive.Cursor(conn)
+    cur.execute('SELECT ts')
+    with pytest.raises(hive.DataError):
+        cur.fetchall()
+    # the cursor argument overrides the connection
+    assert hive.Cursor(conn, strict_timestamps=False).strict_timestamps is False
+
+
+@pytest.mark.parametrize('value,expected', [
+    (True, True), ('true', True), ('1', True), (False, False), ('false', False), ('0', False)])
+def test_strict_timestamps_accepts_url_query_strings(value, expected):
+    # create_engine('hive://...?strict_timestamps=true') passes the flag as a string
+    assert hive._as_bool(value) is expected
 
 
 # Transport failures.
@@ -157,9 +246,29 @@ def test_refused_connection_is_an_operational_error():
     sock.bind(('127.0.0.1', 0))
     port = sock.getsockname()[1]
     sock.close()  # nothing listens on this port now
-    with pytest.raises(hive.OperationalError) as info:
+    with pytest.raises(hive.OperationalError, match='^Could not connect to HiveServer2') as info:
         hive.connect('127.0.0.1', port)
-    assert hive.is_connection_lost(info.value)
+    # never connected, so nothing was lost
+    assert not hive.is_connection_lost(info.value)
+
+
+class FailingTransport(FakeTransport):
+    """thrift_sasl raises this from open() when the server rejects the credentials."""
+
+    def open(self):
+        raise TTransportException(message='Bad status: 3 (Error validating the login)')
+
+
+def test_failed_sasl_handshake_is_not_a_lost_connection():
+    transport = FailingTransport()
+    with pytest.raises(hive.OperationalError) as info:
+        hive.Connection(thrift_transport=transport, strict_timestamps='true')
+    assert str(info.value) == (
+        'Could not connect to HiveServer2: Bad status: 3 (Error validating the login)')
+    assert isinstance(info.value.__cause__, TTransportException)
+    assert not hive.is_connection_lost(info.value)
+    assert not HiveDialect().is_disconnect(info.value, None, None)
+    assert transport.closed
 
 
 # SQLAlchemy reflection with a fake connection.
@@ -182,6 +291,8 @@ class Result(object):
 
 DESCRIBE = [
     ('id', 'int', 'row id'),
+    ('tabbed', 'string', 'col\\tc \\\\ \\u00fc'),
+    ('serde', 'string', 'from deserializer'),
     ('ti', 'tinyint', ''),
     ('d', 'double', ''),
     ('dec38', 'decimal(38,18)', ''),
@@ -203,17 +314,23 @@ FORMATTED = DESCRIBE[:-4] + [
     ('Table Type:         ', 'VIRTUAL_VIEW        ', None),
     ('Table Parameters:', None, None),
     ('', 'bucketing_version   ', '2                   '),
-    ('', 'comment             ', 'the comment         '),
+    ('', 'comment             ', 'the\\ncomment         '),
     ('# Storage Information', None, None),
     ('SerDe Library:      ', 'null                ', None),
     ('# View Information', None, None),
-    ('Original Query:     ', 'SELECT id FROM t', None),
+    ('Original Query:     ', 'SELECT a,           ', None),
+    ('', '                    ', '  b                 '),
+    ('', '                    ', 'FROM t_c            '),
+    ('', '                    ', 'WHERE a > 1         '),
+    ('Expanded Query:     ', 'SELECT `t_c`.`a`,   ', None),
+    ('', '                    ', '  `t_c`.`b`         '),
 ]
 
 
 class FakeSAConnection(object):
-    def __init__(self, show_views=True):
+    def __init__(self, show_views=True, show_views_error='ParseException'):
         self.show_views = show_views
+        self.show_views_error = show_views_error
         self.statements = []
 
     def execute(self, statement):
@@ -223,7 +340,7 @@ class FakeSAConnection(object):
             return Result(['tab_name'], [('t',), ('v',)])
         if sql.startswith('SHOW VIEWS'):
             if not self.show_views:
-                raise sa.exc.OperationalError(sql, {}, Exception('ParseException'))
+                raise sa.exc.OperationalError(sql, {}, Exception(self.show_views_error))
             return Result(['tab_name'], [('v',)])
         if sql.startswith('DESCRIBE FORMATTED'):
             return Result(['col_name', 'data_type', 'comment'], FORMATTED)
@@ -245,6 +362,27 @@ def test_servers_without_show_views_keep_the_old_listing():
     assert HiveDialect().get_view_names(conn) == ['t', 'v']
 
 
+@pytest.mark.parametrize('error', [
+    "FAILED: ParseException line 1:5 cannot recognize input near 'SHOW' 'VIEWS' '<EOF>'",
+    "mismatched input 'VIEWS' expecting {'COLUMNS', 'CREATE', ...}",
+])
+def test_show_views_parse_errors_mean_unsupported(error):
+    conn = FakeSAConnection(show_views=False, show_views_error=error)
+    assert HiveDialect().get_view_names(conn) == ['t', 'v']
+
+
+@pytest.mark.parametrize('error', [
+    'HiveAccessControlException Permission denied: user [u] does not have [SELECT] privilege',
+    'Lost connection to HiveServer2: TSocket read 0 bytes',
+])
+def test_other_show_views_errors_are_raised(error):
+    conn = FakeSAConnection(show_views=False, show_views_error=error)
+    with pytest.raises(sa.exc.OperationalError, match=error.split()[0]):
+        HiveDialect().get_table_names(conn)
+    with pytest.raises(sa.exc.OperationalError):
+        HiveDialect().get_view_names(conn)
+
+
 def test_spark_style_show_tables_uses_the_name_column():
     class SparkConnection(object):
         def execute(self, statement):
@@ -258,10 +396,13 @@ def test_get_columns_types_and_comments():
         cols = HiveDialect().get_columns(FakeSAConnection(), 't')
     by_name = {c['name']: c for c in cols}
     assert [c['name'] for c in cols] == [
-        'id', 'ti', 'd', 'dec38', 'dec', 'vc', 'ch', 'bin', 'arr', 'st', 'when']
+        'id', 'tabbed', 'serde', 'ti', 'd', 'dec38', 'dec', 'vc', 'ch', 'bin', 'arr', 'st', 'when']
     assert by_name['id']['comment'] == 'row id' and by_name['ti']['comment'] is None
+    # Hive Java-escapes comments; 'from deserializer' is its placeholder for none
+    assert by_name['tabbed']['comment'] == 'col\tc \\ \u00fc'
+    assert by_name['serde']['comment'] is None
     t = {k: c['type'] for k, c in by_name.items()}
-    assert isinstance(t['d'], sa.DOUBLE)
+    assert isinstance(t['d'], DOUBLE or sa.Float)
     assert isinstance(t['dec38'], HiveNumeric)
     assert (t['dec38'].precision, t['dec38'].scale) == (38, 18)
     assert (t['dec'].precision, t['dec'].scale) == (10, 0)
@@ -277,7 +418,8 @@ def test_reflected_types_render_in_hive_ddl():
     cols = HiveDialect().get_columns(FakeSAConnection(), 't')[:-1]
     table = sa.Table('copy', sa.MetaData(), *[sa.Column(c['name'], c['type']) for c in cols])
     ddl = str(CreateTable(table).compile(dialect=HiveDialect()))
-    for fragment in ('`ti` TINYINT', '`d` DOUBLE', '`dec38` DECIMAL(38, 18)',
+    for fragment in ('`ti` TINYINT', '`d` DOUBLE' if DOUBLE else '`d` FLOAT',
+                     '`dec38` DECIMAL(38, 18)',
                      '`bin` BINARY', '`arr` array<int>', '`st` struct<a:int,b:decimal(10,2)>'):
         assert fragment in ddl, ddl
 
@@ -320,8 +462,9 @@ def test_bound_values_on_reflected_columns_compile():
 def test_table_comment_view_definition_and_constraints():
     dialect = HiveDialect()
     conn = FakeSAConnection()
-    assert dialect.get_table_comment(conn, 'v') == {'text': 'the comment'}
-    assert dialect.get_view_definition(conn, 'v') == 'SELECT id FROM t'
+    assert dialect.get_table_comment(conn, 'v') == {'text': 'the\ncomment'}
+    # continuation rows joined, indentation kept, the expanded query not included
+    assert dialect.get_view_definition(conn, 'v') == 'SELECT a,\n  b\nFROM t_c\nWHERE a > 1'
     assert dialect.get_unique_constraints(conn, 't') == []
     assert dialect.get_check_constraints(conn, 't') == []
 

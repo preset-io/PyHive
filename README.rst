@@ -131,6 +131,23 @@ Passing session configuration
         connect_args={'auth': 'LDAP'},
     )
 
+Hive TIMESTAMP precision
+------------------------
+Hive ``TIMESTAMP`` values can have up to nine fractional digits, but Python's ``datetime`` holds
+only microseconds. By default the Hive DB-API truncates the extra digits (and logs a warning
+once). To raise ``DataError`` instead of losing precision, pass ``strict_timestamps=True``:
+
+.. code-block:: python
+
+    # DB-API, for the whole connection or for one cursor
+    conn = hive.connect('localhost', strict_timestamps=True)
+    cursor = conn.cursor(strict_timestamps=True)
+    # SQLAlchemy
+    create_engine('hive://localhost:10000/default', connect_args={'strict_timestamps': True})
+    create_engine('hive://localhost:10000/default?strict_timestamps=true')
+
+To read such values exactly, cast the column to ``STRING``.
+
 Requirements
 ************
 

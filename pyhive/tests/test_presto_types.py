@@ -21,6 +21,10 @@ from pyhive import exc
 from pyhive import presto
 from pyhive.sqlalchemy_hive import HiveDialect
 from pyhive.sqlalchemy_presto import PrestoDialect
+from pyhive.sqlalchemy_trino import TrinoDialect
+
+# Same name as the setup.py entry point, so this works without an installed package.
+sa.dialects.registry.register('trino.pyhive', 'pyhive.sqlalchemy_trino', 'TrinoDialect')
 
 BIG = Decimal('12345678901234567890.123456789012345678')
 BIGINT_MIN = -9223372036854775808
@@ -56,15 +60,15 @@ class FakeSession(object):
         return FakeResponse({'id': 'q', 'columns': self.columns, 'data': self.data})
 
 
-def engine(session, database='memory/analytics'):
+def engine(session, database='memory/analytics', scheme='presto'):
     return sa.create_engine(
-        'presto://tester@example.invalid:8080/' + database,
+        scheme + '://tester@example.invalid:8080/' + database,
         connect_args={'requests_session': session},
     )
 
 
-def scalar(columns, data, expression):
-    with engine(FakeSession(columns, data)).connect() as conn:
+def scalar(columns, data, expression, scheme='presto'):
+    with engine(FakeSession(columns, data), scheme=scheme).connect() as conn:
         return conn.scalar(sa.select(expression))
 
 
@@ -80,10 +84,53 @@ def test_decimal_result_processor_does_not_go_through_float():
     assert sa.DECIMAL(38, 18).result_processor(PrestoDialect(), None) is None
 
 
-def test_float_columns_still_return_float():
+@pytest.mark.parametrize('sa_type', [sa.Float, sa.Float(precision=53), sa.REAL, sa.FLOAT])
+def test_float_columns_still_return_float(sa_type):
     got = scalar([{'name': 'r', 'type': 'double'}], [[1.25]],
-                 sa.literal_column('r', sa.Float))
+                 sa.literal_column('r', sa_type))
     assert got == 1.25 and type(got) is float
+
+
+def test_float_asdecimal_still_returns_decimal():
+    got = scalar([{'name': 'r', 'type': 'double'}], [[1.25]],
+                 sa.literal_column('r', sa.Float(asdecimal=True)))
+    assert got == Decimal('1.2500000000') and type(got) is Decimal
+
+
+# Numeric over DOUBLE/REAL/integer results still returns Decimal, as on master.
+
+@pytest.mark.parametrize('presto_type,value,sa_type,expected', [
+    ('double', 1.1, sa.Numeric(10, 2), Decimal('1.10')),
+    ('real', 1.1, sa.Numeric(10, 2), Decimal('1.10')),
+    ('double', 1.1, sa.Numeric, Decimal('1.1000000000')),
+    ('double', 1.1, sa.Numeric(10, 2, decimal_return_scale=4), Decimal('1.1000')),
+    ('double', 1.1, sa.NUMERIC(10, 2), Decimal('1.10')),
+    ('bigint', 9223372036854775807, sa.Numeric(20, 2), Decimal('9223372036854775807.00')),
+    ('integer', -5, sa.Numeric(10, 0), Decimal('-5')),
+])
+def test_numeric_over_non_decimal_results_returns_decimal(presto_type, value, sa_type, expected):
+    got = scalar([{'name': 'v', 'type': presto_type}], [[value]],
+                 sa.literal_column('v', sa_type))
+    assert got == expected and type(got) is Decimal
+    assert str(got) == str(expected)
+
+
+@pytest.mark.parametrize('sa_type', [sa.Numeric(38, 18), sa.NUMERIC(38, 18), sa.Numeric])
+def test_numeric_over_decimal_results_stays_exact(sa_type):
+    got = scalar([{'name': 'amount', 'type': 'decimal(38,18)'}],
+                 [[str(BIG)]], sa.literal_column('amount', sa_type))
+    assert got == BIG and type(got) is Decimal
+
+
+def test_numeric_asdecimal_false_returns_float():
+    got = scalar([{'name': 'amount', 'type': 'decimal(10,2)'}], [['1.25']],
+                 sa.literal_column('amount', sa.Numeric(10, 2, asdecimal=False)))
+    assert got == 1.25 and type(got) is float
+
+
+def test_numeric_null_stays_null():
+    assert scalar([{'name': 'v', 'type': 'double'}], [[None]],
+                  sa.literal_column('v', sa.Numeric(10, 2))) is None
 
 
 # Decimal bound parameters.
@@ -156,10 +203,80 @@ def test_timestamp_with_time_zone(value, offset):
     assert got.replace(tzinfo=None).microsecond == 123000
 
 
-def test_time_with_time_zone():
-    got = scalar([{'name': 'v', 'type': 'time with time zone'}], [['01:02:03.456 +01:00']],
+@pytest.mark.parametrize('scheme', ['presto', 'trino+pyhive'])
+@pytest.mark.parametrize('value,offset', [
+    ('01:02:03.456 +01:00', datetime.timedelta(hours=1)),
+    # Trino's SqlTimeWithTimeZone has no space before the offset.
+    ('01:02:03.456+01:00', datetime.timedelta(hours=1)),
+    ('12:34:56.123-05:30', -datetime.timedelta(hours=5, minutes=30)),
+    ('00:14:42.457+00:00', datetime.timedelta(0)),
+])
+def test_time_with_time_zone(scheme, value, offset):
+    got = scalar([{'name': 'v', 'type': 'time with time zone'}], [[value]],
+                 sa.literal_column('v', sa.Time(timezone=True)), scheme=scheme)
+    assert got.utcoffset() == offset
+
+
+def test_trino_dialect_uses_the_presto_types():
+    assert type(engine(FakeSession(), scheme='trino+pyhive').dialect) is TrinoDialect
+    assert TrinoDialect.colspecs is PrestoDialect.colspecs
+
+
+@pytest.mark.parametrize('zone,offset', [
+    ('UTC', datetime.timedelta(0)),
+    ('Z', datetime.timedelta(0)),
+    ('Zulu', datetime.timedelta(0)),
+    ('GMT', datetime.timedelta(0)),
+    ('UCT', datetime.timedelta(0)),
+    ('Etc/UTC', datetime.timedelta(0)),
+    # POSIX sign inversion: Etc/GMT+5 is UTC-05:00.
+    ('Etc/GMT+5', datetime.timedelta(hours=-5)),
+    ('Etc/GMT-14', datetime.timedelta(hours=14)),
+    ('Etc/GMT0', datetime.timedelta(0)),
+])
+def test_time_with_fixed_region_zone(zone, offset):
+    got = scalar([{'name': 'v', 'type': 'time with time zone'}], [['00:13:38.240 ' + zone]],
                  sa.literal_column('v', sa.Time(timezone=True)))
-    assert got.utcoffset() == datetime.timedelta(hours=1)
+    assert got.tzinfo is not None and got.utcoffset() == offset
+    assert got == datetime.time(0, 13, 38, 240000, datetime.timezone(offset))
+
+
+def test_time_with_region_zone_raises():
+    # A TIME has no date, so a DST-observing zone has no single offset.
+    with pytest.raises(exc.DataError, match='Region time zone'):
+        scalar([{'name': 'v', 'type': 'time with time zone'}],
+               [['00:13:38.240 America/New_York']],
+               sa.literal_column('v', sa.Time(timezone=True)))
+
+
+def test_timestamp_with_fixed_zone_uses_datetime_timezone():
+    got = scalar([{'name': 'v', 'type': 'timestamp with time zone'}],
+                 [['2026-09-24 12:34:56.123 Etc/GMT+5']],
+                 sa.literal_column('v', sa.TIMESTAMP(timezone=True)))
+    assert got.tzinfo == datetime.timezone(datetime.timedelta(hours=-5))
+
+
+@pytest.mark.parametrize('value,message', [
+    # 01:30 happens twice on 2026-11-01 in New York (EDT, then EST).
+    ('2026-11-01 01:30:00.000 America/New_York', 'Ambiguous'),
+    # 02:30 does not happen on 2026-03-08 in New York.
+    ('2026-03-08 02:30:00.000 America/New_York', 'Nonexistent'),
+])
+def test_timestamp_at_dst_transition_raises(value, message):
+    with pytest.raises(exc.DataError, match=message):
+        scalar([{'name': 'v', 'type': 'timestamp with time zone'}], [[value]],
+               sa.literal_column('v', sa.TIMESTAMP(timezone=True)))
+
+
+@pytest.mark.parametrize('value,offset', [
+    ('2026-11-01 00:59:59.999 America/New_York', datetime.timedelta(hours=-4)),
+    ('2026-11-01 02:00:00.000 America/New_York', datetime.timedelta(hours=-5)),
+    ('2026-03-08 03:00:00.000 America/New_York', datetime.timedelta(hours=-4)),
+])
+def test_timestamp_next_to_dst_transition(value, offset):
+    got = scalar([{'name': 'v', 'type': 'timestamp with time zone'}], [[value]],
+                 sa.literal_column('v', sa.TIMESTAMP(timezone=True)))
+    assert got.utcoffset() == offset
 
 
 def test_null_temporal_stays_null():
@@ -173,9 +290,27 @@ def test_null_temporal_stays_null():
     'yesterday',
 ])
 def test_unrepresentable_temporal_value_raises(value):
-    with pytest.raises(ValueError):
+    with pytest.raises(exc.DataError):
         scalar([{'name': 'v', 'type': 'timestamp'}], [[value]],
                sa.literal_column('v', sa.DateTime))
+
+
+@pytest.mark.parametrize('presto_type,value,sa_type', [
+    # Presto returns these for DATE; datetime.date cannot hold them.
+    ('date', '-0001-01-01', sa.Date),
+    ('date', '+10000-01-01', sa.Date),
+    ('date', '0000-01-01', sa.Date),
+    ('date', '2001-02-29', sa.Date),
+    # A Date-typed expression over a timestamp value.
+    ('timestamp', '2026-09-24 12:34:56.123', sa.Date),
+    ('timestamp', '-0001-01-01 00:00:00.000', sa.DateTime),
+    ('time', '24:00:00.000', sa.Time),
+])
+def test_out_of_range_temporal_value_raises_data_error(presto_type, value, sa_type):
+    with pytest.raises(exc.DataError) as caught:
+        scalar([{'name': 'v', 'type': presto_type}], [[value]],
+               sa.literal_column('v', sa_type))
+    assert value in str(caught.value)
 
 
 def test_untyped_temporal_values_are_unchanged():
@@ -199,6 +334,8 @@ def test_parameterized_types_reflect():
         ('unbounded', 'varchar'), ('code', 'char(3)'), ('t', 'time'),
         ('tz', 'timestamp with time zone'), ('ttz', 'time with time zone'),
         ('trino_ts', 'timestamp(6) with time zone'), ('n', 'integer'), ('d', 'date'),
+        ('ts3', 'timestamp(3)'), ('t3', 'time(3)'), ('ttz3', 'time(3) with time zone'),
+        ('ts', 'timestamp'),
     ])
     assert caught == []
     assert isinstance(types_['amount'], sa.DECIMAL)
@@ -213,6 +350,30 @@ def test_parameterized_types_reflect():
     assert isinstance(types_['trino_ts'], sa.TIMESTAMP) and types_['trino_ts'].timezone
     assert isinstance(types_['n'], sa.Integer)
     assert isinstance(types_['d'], sa.DATE)
+    assert isinstance(types_['ts3'], sa.TIMESTAMP) and not types_['ts3'].timezone
+    assert isinstance(types_['t3'], sa.TIME) and not types_['t3'].timezone
+    assert isinstance(types_['ttz3'], sa.TIME) and types_['ttz3'].timezone
+    assert isinstance(types_['ts'], sa.TIMESTAMP) and not types_['ts'].timezone
+
+
+def test_trino_show_columns_reflect_with_precision():
+    session = FakeSession(SHOW_COLUMNS, [['ts', 'timestamp(3)', '', ''],
+                                         ['t', 'time(3)', '', ''],
+                                         ['tz', 'timestamp(3) with time zone', '', '']])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        columns = sa.inspect(engine(session, scheme='trino+pyhive')).get_columns('t')
+    assert [str(w.message) for w in caught] == []
+    assert [type(c['type']) for c in columns] == [sa.TIMESTAMP, sa.TIME, sa.TIMESTAMP]
+    assert [c['type'].timezone for c in columns] == [False, False, True]
+
+
+@pytest.mark.parametrize('type_str', ['timestamp(3, 1)', 'time(3,6) with time zone',
+                                      'date(3)', 'interval day to second'])
+def test_unsupported_temporal_spellings_still_warn(type_str):
+    types_, caught = reflect([('x', type_str)])
+    assert isinstance(types_['x'], sa.types.NullType)
+    assert len(caught) == 1
 
 
 def test_unknown_types_still_warn_and_reflect_as_null_type():
