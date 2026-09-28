@@ -13,11 +13,11 @@ from decimal import Decimal
 
 import dateutil.tz
 import pytest
+import requests
 import sqlalchemy as sa
 
 from pyhive import common
 from pyhive import exc
-from pyhive import hive
 from pyhive import presto
 from pyhive.sqlalchemy_hive import HiveDialect
 from pyhive.sqlalchemy_presto import PrestoDialect
@@ -432,9 +432,10 @@ def test_other_numbers_are_unchanged(value, escaped):
     assert got == escaped and type(got) is type(escaped)
 
 
-# The Hive driver shares common.ParamEscaper; its behaviour must not change.
+# The Presto change must not leak into the shared common.ParamEscaper. (Hive's own
+# escaper renders these values for Hive; see test_hive_sqlalchemy2.py.)
 
-@pytest.mark.parametrize('escaper', [common.ParamEscaper(), hive.HiveParamEscaper()])
+@pytest.mark.parametrize('escaper', [common.ParamEscaper()])
 def test_hive_and_common_escaping_is_unchanged(escaper):
     assert escaper.escape_item(BIGINT_MIN) == BIGINT_MIN
     assert escaper.escape_item(1.5) == 1.5
@@ -445,10 +446,57 @@ def test_hive_and_common_escaping_is_unchanged(escaper):
 
 
 def test_hive_dialect_does_not_pick_up_presto_types():
-    presto_types = set(PrestoDialect.colspecs.values())
+    # Both map Float to SQLAlchemy's own Float; no pyhive Presto type may leak into Hive.
+    presto_types = {t for t in PrestoDialect.colspecs.values() if t.__module__.startswith('pyhive')}
     assert not issubclass(HiveDialect, PrestoDialect)
     assert not presto_types & set(HiveDialect.colspecs.values())
 
 
 def test_dateutil_region_zones_are_available():
     assert dateutil.tz.gettz('America/New_York') is not None
+
+
+# Transport failures are DB-API errors.
+
+class _RefusingSession(object):
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+
+    def post(self, *args, **kwargs):
+        self.calls += 1
+        raise self.error
+
+    get = delete = post
+
+
+@pytest.mark.parametrize('error', [
+    requests.exceptions.ConnectionError('Connection refused'),
+    requests.exceptions.ReadTimeout('read timed out'),
+    requests.exceptions.ChunkedEncodingError('connection reset'),
+])
+def test_transport_errors_are_operational_errors(error):
+    cursor = presto.connect('h', requests_session=_RefusingSession(error)).cursor()
+    with pytest.raises(exc.OperationalError) as info:
+        cursor.execute('SELECT 1')
+    assert info.value.__cause__ is error
+    assert presto.is_connection_lost(info.value)
+    assert PrestoDialect().is_disconnect(info.value, None, None)
+
+
+def test_server_errors_are_not_disconnects():
+    err = exc.OperationalError({'message': 'line 1:1: mismatched input'})
+    assert not presto.is_connection_lost(err)
+    assert not PrestoDialect().is_disconnect(err, None, None)
+
+
+def test_refused_connection_through_sqlalchemy_is_a_dbapi_error():
+    import socket
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    sock.close()  # nothing listens on this port now
+    engine = sa.create_engine('presto://u@127.0.0.1:{}/memory/default'.format(port))
+    with pytest.raises(sa.exc.OperationalError):
+        with engine.connect() as conn:
+            conn.exec_driver_sql('SELECT 1')

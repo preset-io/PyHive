@@ -77,6 +77,46 @@ class PrestoParamEscaper(common.ParamEscaper):
 _escaper = PrestoParamEscaper()
 
 
+# Failures to reach the coordinator: the request never got an HTTP response.
+_TRANSPORT_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+class _SessionWrapper(object):
+    """Proxy for the requests session that raises transport failures as ``OperationalError``.
+
+    A refused, reset or timed-out request surfaces from requests as
+    ``requests.exceptions.ConnectionError`` (or ``Timeout``), which is not a DB-API
+    exception, so callers such as connection pools cannot tell a lost server from a
+    programming error.
+    """
+
+    def __init__(self, session):
+        self._session = session
+
+    def __getattr__(self, name):
+        attr = getattr(self._session, name)
+        if name not in ('get', 'post', 'delete', 'put', 'head', 'request'):
+            return attr
+
+        def call(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except _TRANSPORT_ERRORS as e:
+                err = OperationalError('Lost connection to the Presto coordinator: {}'.format(e))
+                err.__cause__ = e
+                raise err
+        return call
+
+
+def is_connection_lost(e):
+    """True if ``e`` was raised because the coordinator could not be reached."""
+    return isinstance(e, OperationalError) and isinstance(e.__cause__, _TRANSPORT_ERRORS)
+
+
 class JWTAuth(requests.auth.AuthBase):
     """
     Simple authorization handler for JWT requests.
@@ -225,7 +265,7 @@ class Cursor(common.DBAPICursor):
             raise ValueError("Protocol must be http/https, was {!r}".format(protocol))
         self._protocol = protocol
 
-        self._requests_session = requests_session or requests
+        self._requests_session = _SessionWrapper(requests_session or requests)
 
         requests_kwargs = dict(requests_kwargs) if requests_kwargs is not None else {}
 

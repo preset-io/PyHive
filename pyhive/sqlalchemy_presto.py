@@ -286,6 +286,9 @@ class PrestoDialect(default.DefaultDialect):
     supports_unicode_statements = True
     supports_unicode_binds = True
     supports_statement_cache = False
+
+    def is_disconnect(self, e, connection, cursor):
+        return presto.is_connection_lost(e)
     returns_unicode_strings = True
     description_encoding = None
     supports_native_boolean = True

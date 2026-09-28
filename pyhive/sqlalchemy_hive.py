@@ -36,16 +36,60 @@ from sqlalchemy.sql.compiler import SQLCompiler
 from pyhive import hive
 from pyhive.common import UniversalSet
 
-from dateutil.parser import parse
+import dateutil.tz
 from decimal import Decimal
+
+
+_DATE_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
+_ZONED_TIMESTAMP_PATTERN = re.compile(r'^(\d+-\d+-\d+ \d+:\d+:\d+(?:\.\d+)?) (\S+)$')
+
+
+def _parse_date(value):
+    """A Hive DATE string ('YYYY-MM-DD') as a ``date``.
+
+    Values ``date`` cannot hold (year 0, negative years, years past 9999) raise
+    ``DataError`` instead of being misread.
+    """
+    match = _DATE_PATTERN.match(value.strip())
+    if match:
+        try:
+            return datetime.date(*(int(part) for part in match.groups()))
+        except ValueError as e:
+            raise hive.DataError('Invalid or out-of-range Hive DATE {!r}: {}'.format(value, e))
+    raise hive.DataError('Invalid or out-of-range Hive DATE {!r}'.format(value))
+
+
+def _parse_timestamp_text(value):
+    """A TIMESTAMP or TIMESTAMP WITH LOCAL TIME ZONE string as a ``datetime``.
+
+    A value with a zone ('2024-07-01 12:00:00.0 America/New_York') becomes an aware
+    ``datetime``. Local times that are ambiguous (DST fall-back) or nonexistent
+    (spring-forward gap) in that zone, and unknown zones, raise ``DataError`` rather than
+    silently resolving to one of the candidate instants.
+    """
+    match = _ZONED_TIMESTAMP_PATTERN.match(value.strip())
+    if not match:
+        return hive._parse_timestamp(value)
+    local, zone_name = match.groups()
+    zone = dateutil.tz.gettz(zone_name)
+    if zone is None:
+        raise hive.DataError('Unknown time zone in {!r}'.format(value))
+    result = hive._parse_timestamp(local).replace(tzinfo=zone)
+    if not dateutil.tz.datetime_exists(result):
+        raise hive.DataError('Nonexistent local time (DST gap) in {!r}'.format(value))
+    if dateutil.tz.datetime_ambiguous(result):
+        raise hive.DataError('Ambiguous local time (DST fall-back) in {!r}'.format(value))
+    return result
 
 
 class HiveStringTypeBase(types.TypeDecorator):
     """Translates strings returned by Thrift into something else"""
     impl = types.String
+    cache_ok = True
 
     def process_bind_param(self, value, dialect):
-        raise NotImplementedError("Writing to Hive not supported")
+        # The DB-API escaper renders date, datetime and Decimal values itself.
+        return value
 
 
 class HiveDate(HiveStringTypeBase):
@@ -62,7 +106,7 @@ class HiveDate(HiveStringTypeBase):
             elif isinstance(value, datetime.date):
                 return value
             elif value is not None:
-                return parse(value).date()
+                return _parse_date(value)
             else:
                 return None
 
@@ -91,7 +135,7 @@ class HiveTimestamp(HiveStringTypeBase):
             if isinstance(value, datetime.datetime):
                 return value
             elif value is not None:
-                return parse(value)
+                return _parse_timestamp_text(value)
             else:
                 return None
 
@@ -126,6 +170,121 @@ class HiveDecimal(HiveStringTypeBase):
         return self.impl
 
 
+class HiveNumeric(types.DECIMAL):
+    """DECIMAL(p, s) as reflected from Hive, and the result type of ``Numeric``.
+
+    The DB-API returns ``Decimal`` for DECIMAL columns (kept exact), ``float`` for
+    DOUBLE/FLOAT and ``int`` for integer types. ``Numeric`` must return ``Decimal`` whatever
+    the column's type, so floats are converted the way SQLAlchemy's to_decimal processor does
+    (``decimal_return_scale``/``scale``) and integers exactly.
+    """
+
+    def result_processor(self, dialect, coltype):
+        if not self.asdecimal:
+            def to_float(value):
+                if value is None or isinstance(value, bool):
+                    return value
+                return float(value)
+            return to_float
+        scale = self._effective_decimal_return_scale
+        fmt = '%.{:d}f'.format(scale)
+
+        def process(value):
+            if value is None or isinstance(value, bool):
+                return value
+            if isinstance(value, Decimal):
+                return value
+            if isinstance(value, float):
+                return Decimal(fmt % value)
+            if isinstance(value, int):
+                # Exact: formatting through float would lose digits.
+                return Decimal('{}.{}'.format(value, '0' * scale)) if scale else Decimal(value)
+            return Decimal(value)
+
+        return process
+
+
+class HiveDateTimeResult(types.DateTime):
+    """Plain DateTime columns: TIMESTAMP arrives as ``datetime`` from the DB-API, TIMESTAMP
+    WITH LOCAL TIME ZONE as text with a zone."""
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None or isinstance(value, datetime.datetime):
+                return value
+            return _parse_timestamp_text(value)
+        return process
+
+
+class HiveComplexType(types.UserDefinedType):
+    """ARRAY, MAP, STRUCT and UNIONTYPE columns.
+
+    HiveServer2 returns their values as JSON text, so values are strings; the type keeps the
+    full Hive type (e.g. ``array<struct<x:int>>``) for DDL and display.
+    """
+
+    cache_ok = True
+
+    def __init__(self, type_text):
+        self.type_text = type_text
+
+    def get_col_spec(self, **kw):
+        return self.type_text
+
+    @property
+    def python_type(self):
+        return str
+
+    def __repr__(self):
+        return 'HiveComplexType({!r})'.format(self.type_text)
+
+
+def _parse_type(col_type):
+    """Map a type from ``DESCRIBE`` (e.g. ``decimal(10,2)``, ``map<string,int>``) to SQLAlchemy.
+
+    Returns None for unknown types.
+    """
+    col_type = col_type.strip()
+    name = re.search(r'^\w+', col_type).group(0).lower()
+    args = re.match(r'^\w+\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$', col_type)
+    if name in ('array', 'map', 'struct', 'uniontype'):
+        return HiveComplexType(col_type)
+    if name == 'decimal':
+        if args:
+            precision = int(args.group(1))
+            scale = int(args.group(2)) if args.group(2) is not None else 0
+        else:
+            precision, scale = 10, 0  # Hive's default for a bare DECIMAL
+        return HiveNumeric(precision=precision, scale=scale)
+    if name in ('varchar', 'char') and args:
+        return (types.VARCHAR if name == 'varchar' else types.CHAR)(int(args.group(1)))
+    coltype = _type_map.get(name)
+    if coltype is None:
+        return None
+    return coltype()
+
+
+_JAVA_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|[tnrbf"\'\\])')
+_JAVA_ESCAPES = {'t': '\t', 'n': '\n', 'r': '\r', 'b': '\b', 'f': '\f',
+                 '"': '"', "'": "'", '\\': '\\'}
+
+
+def _unescape_comment(comment):
+    """Undo Hive's Java escaping of comments; ``from deserializer`` means no comment."""
+    if not comment or comment == 'from deserializer':
+        return None
+
+    def unescape(match):
+        code = match.group(1)
+        if code.startswith('u'):
+            return chr(int(code[1:], 16))
+        return _JAVA_ESCAPES[code]
+
+    text = _JAVA_ESCAPE.sub(unescape, comment)
+    # Characters outside the BMP arrive as a \uXXXX surrogate pair.
+    return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+
+
 class HiveIdentifierPreparer(compiler.IdentifierPreparer):
     # Just quote everything to make things simpler / easier to upgrade
     reserved_words = UniversalSet()
@@ -144,13 +303,14 @@ _type_map = {
     'int': types.Integer,
     'bigint': types.BigInteger,
     'float': types.Float,
-    'double': types.Float,
+    # types.DOUBLE is new in SQLAlchemy 2.0; 1.x reflected DOUBLE as Float.
+    'double': getattr(types, 'DOUBLE', None) or types.Float,
     'string': types.String,
     'varchar': types.String,
     'char': types.String,
     'date': HiveDate,
     'timestamp': HiveTimestamp,
-    'binary': types.String,
+    'binary': types.BINARY,
     'array': types.String,
     'map': types.String,
     'struct': types.String,
@@ -191,8 +351,21 @@ class HiveTypeCompiler(compiler.GenericTypeCompiler):
     def visit_INTEGER(self, type_):
         return 'INT'
 
+    def visit_TINYINT(self, type_):
+        # Reflected TINYINT columns use the MySQL type class.
+        return 'TINYINT'
+
     def visit_NUMERIC(self, type_):
-        return 'DECIMAL'
+        # A bare DECIMAL is DECIMAL(10,0) in Hive, which would turn larger values into NULL
+        # and drop the fraction.
+        if type_.precision is None:
+            return 'DECIMAL'
+        if type_.scale is None:
+            return 'DECIMAL({})'.format(type_.precision)
+        return 'DECIMAL({}, {})'.format(type_.precision, type_.scale)
+
+    def visit_DECIMAL(self, type_):
+        return self.visit_NUMERIC(type_)
 
     def visit_CHAR(self, type_):
         return 'STRING'
@@ -265,7 +438,13 @@ class HiveDialect(default.DefaultDialect):
     description_encoding = None
     supports_multivalues_insert = True
     type_compiler = HiveTypeCompiler
-    colspecs = {types.Date: HiveDateResult}
+    colspecs = {
+        types.Date: HiveDateResult,
+        types.DateTime: HiveDateTimeResult,
+        types.Numeric: HiveNumeric,
+        # Float subclasses Numeric; keep SQLAlchemy's float handling for it.
+        types.Float: types.Float,
+    }
     supports_sane_rowcount = False
     supports_statement_cache = False
 
@@ -292,10 +471,40 @@ class HiveDialect(default.DefaultDialect):
         # Equivalent to SHOW DATABASES
         return [row[0] for row in connection.execute(text('SHOW SCHEMAS'))]
 
+    def _show_names(self, connection, what, schema):
+        query = 'SHOW {}'.format(what)
+        if schema:
+            query += ' IN ' + self.identifier_preparer.quote_identifier(schema)
+        result = connection.execute(text(query))
+        keys = list(result.keys())
+        # HiveServer2 returns one ``tab_name`` column; Spark Thrift Server returns
+        # (namespace, tableName|viewName, isTemporary).
+        index = 0
+        for i, key in enumerate(keys):
+            if key.split('.')[-1].lower() in ('tablename', 'viewname'):
+                index = i
+        return [row[index] for row in result]
+
+    # Parse errors from Hive (< 2.2) and Spark Thrift Server for a SHOW VIEWS they lack.
+    _SHOW_VIEWS_UNSUPPORTED = re.compile(
+        r'ParseException|cannot recognize input|mismatched input|no viable alternative')
+
+    def _view_names(self, connection, schema):
+        """View names, or None when the server has no SHOW VIEWS (Hive < 2.2)."""
+        try:
+            return self._show_names(connection, 'VIEWS', schema)
+        except exc.OperationalError as e:
+            # Anything else (authorization, lost connection, ...) is a real error.
+            if self._SHOW_VIEWS_UNSUPPORTED.search(str(getattr(e, 'orig', None) or e)):
+                return None
+            raise
+
     def get_view_names(self, connection, schema=None, **kw):
-        # Hive does not provide functionality to query tableType
-        # This allows reflection to not crash at the cost of being inaccurate
-        return self.get_table_names(connection, schema, **kw)
+        views = self._view_names(connection, schema)
+        if views is None:
+            # No SHOW VIEWS: keep the old behaviour of listing every table.
+            return self._show_names(connection, 'TABLES', schema)
+        return views
 
     def _get_table_columns(self, connection, table_name, schema):
         full_table = table_name
@@ -343,10 +552,8 @@ class HiveDialect(default.DefaultDialect):
             # Take out the more detailed type information
             # e.g. 'map<int,int>' -> 'map'
             #      'decimal(10,1)' -> decimal
-            col_type = re.search(r'^\w+', col_type).group(0)
-            try:
-                coltype = _type_map[col_type]
-            except KeyError:
+            coltype = _parse_type(col_type)
+            if coltype is None:
                 util.warn("Did not recognize type '%s' of column '%s'" % (col_type, col_name))
                 coltype = types.NullType
 
@@ -355,8 +562,57 @@ class HiveDialect(default.DefaultDialect):
                 'type': coltype,
                 'nullable': True,
                 'default': None,
+                'comment': _unescape_comment(_comment),
             })
         return result
+
+    def _describe_formatted_rows(self, connection, table_name, schema):
+        full_table = table_name
+        if schema:
+            full_table = schema + '.' + table_name
+        # Same unquoted name as DESCRIBE, which has just accepted it.
+        self._get_table_columns(connection, table_name, schema)  # NoSuchTableError
+        return connection.execute(text('DESCRIBE FORMATTED {}'.format(full_table))).fetchall()
+
+    def _describe_formatted(self, connection, table_name, schema):
+        rows = self._describe_formatted_rows(connection, table_name, schema)
+        return [tuple(col.strip() if col else col for col in row) for row in rows]
+
+    def get_table_comment(self, connection, table_name, schema=None, **kw):
+        in_params = False
+        for key, name, value in self._describe_formatted(connection, table_name, schema):
+            if key == 'Table Parameters:':
+                in_params = True
+            elif in_params and key:
+                break
+            elif in_params and name == 'comment':
+                return {'text': _unescape_comment(value)}
+        return {'text': None}
+
+    def get_view_definition(self, connection, view_name, schema=None, **kw):
+        rows = self._describe_formatted_rows(connection, view_name, schema)
+        for i, (key, value, _) in enumerate(rows):
+            # Hive 4 labels it "Original Query:", Hive 2/3 "View Original Text:".
+            if (key or '').strip() not in ('Original Query:', 'View Original Text:'):
+                continue
+            # Each further line of the query comes as a row ('', <padding>, '<line>').
+            # Only rstrip: leading whitespace is the query's own indentation.
+            lines = [(value or '').rstrip()]
+            for next_key, _, line in rows[i + 1:]:
+                if (next_key or '').strip() or line is None:
+                    break
+                lines.append(line.rstrip())
+            return '\n'.join(lines).rstrip('\n')
+        raise exc.NoSuchTableError(view_name)
+
+    def get_unique_constraints(self, connection, table_name, schema=None, **kw):
+        return []
+
+    def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        return []
+
+    def is_disconnect(self, e, connection, cursor):
+        return hive.is_connection_lost(e)
 
     def get_foreign_keys(self, connection, table_name, schema=None, **kw):
         # Hive has no support for foreign keys.
@@ -385,10 +641,10 @@ class HiveDialect(default.DefaultDialect):
             return []
 
     def get_table_names(self, connection, schema=None, **kw):
-        query = 'SHOW TABLES'
-        if schema:
-            query += ' IN ' + self.identifier_preparer.quote_identifier(schema)
-        return [row[0] for row in connection.execute(text(query))]
+        tables = self._show_names(connection, 'TABLES', schema)
+        # SHOW TABLES lists views too; SQLAlchemy expects tables only.
+        views = set(self._view_names(connection, schema) or ())
+        return [name for name in tables if name not in views]
 
     def do_rollback(self, dbapi_connection):
         # No transactions for Hive
