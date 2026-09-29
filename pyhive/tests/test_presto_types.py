@@ -404,6 +404,34 @@ def test_get_view_names_defaults_like_the_dbapi():
     assert "table_schema = 'default'" in session.statements[-1]
 
 
+class _TablesAndViewsSession(FakeSession):
+    """SHOW TABLES lists a table and a view; information_schema.views lists the view."""
+
+    def post(self, url, data=None, headers=None, **kwargs):
+        statement = data.decode('utf-8')
+        self.statements.append(statement)
+        if statement.startswith('SHOW TABLES'):
+            columns, rows = [{'name': 'Table', 'type': 'varchar'}], [['t_all'], ['v_all']]
+        else:
+            columns, rows = [{'name': 'table_name', 'type': 'varchar'}], [['v_all']]
+        return FakeResponse({'id': 'q', 'columns': columns, 'data': rows})
+
+
+@pytest.mark.parametrize('scheme', ['presto', 'trino+pyhive'])
+def test_get_table_names_excludes_views(scheme):
+    session = _TablesAndViewsSession()
+    insp = sa.inspect(engine(session, scheme=scheme))
+    assert insp.get_table_names() == ['t_all']
+    assert insp.get_view_names() == ['v_all']
+
+
+def test_get_table_names_excludes_views_in_explicit_schema():
+    session = _TablesAndViewsSession()
+    assert sa.inspect(engine(session)).get_table_names(schema='other') == ['t_all']
+    assert session.statements[0] == 'SHOW TABLES FROM "other"'
+    assert "table_schema = 'other'" in session.statements[1]
+
+
 # Primary key reflection.
 
 def test_get_pk_constraint_is_a_constraint_dict():

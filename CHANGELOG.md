@@ -54,16 +54,13 @@ Changes:
   ``get_check_constraints`` are implemented; ``Numeric(p, s)`` DDL keeps its
   precision and scale; ``TINYINT`` compiles; values can be bound against
   reflected DATE/TIMESTAMP/DECIMAL columns.
-
-0.7.0.3
-=======
-
 - Presto SQLAlchemy dialect: keep full precision for DECIMAL results and
   parameters, return ``date``/``datetime``/``time`` objects for typed temporal
   columns (including Trino's ``12:34:56.123+05:30`` TIME WITH TIME ZONE
   format), reflect parameterized types (``decimal(p,s)``, ``varchar(n)``,
   ``char(n)``, ``time``, ``timestamp(p)``, ``time(p)``, ``... with time
-  zone``), implement ``get_view_names``, return a constraint dict from
+  zone``), implement ``get_view_names`` (``get_table_names`` no longer lists
+  views), return a constraint dict from
   ``get_pk_constraint``, and bind the minimum BIGINT. ``Numeric`` over a
   DOUBLE/REAL/integer result still returns ``Decimal``; ``Float`` returns
   ``float``. The Trino dialect shares all of this.
@@ -75,8 +72,7 @@ Changes:
   both the existing-version check and the upload. PR builds are versioned
   ``<version>+pr.<n>.g<revision>`` and skip the existing-version check.
 
-Behaviour changes
------------------
+**Behaviour changes** (typed temporal reads, Hive ``Date`` columns):
 
 Typed Presto/Trino ``Date``, ``DateTime`` and ``Time`` results used to come back
 as the raw strings. They are now parsed, and a value that cannot be represented
