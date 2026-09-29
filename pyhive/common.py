@@ -92,10 +92,14 @@ class DBAPICursor(with_metaclass(abc.ABCMeta, object)):
         """
         for parameters in seq_of_parameters[:-1]:
             self.execute(operation, parameters)
-            while self._state != self._STATE_FINISHED:
-                self._fetch_more()
+            self._discard_results()
         if seq_of_parameters:
             self.execute(operation, seq_of_parameters[-1])
+
+    def _discard_results(self):
+        """Consume the current operation's results before the next execute."""
+        while self._state != self._STATE_FINISHED:
+            self._fetch_more()
 
     def fetchone(self):
         """Fetch the next row of a query result set, returning a single sequence, or ``None`` when

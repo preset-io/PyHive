@@ -9,6 +9,8 @@ from __future__ import absolute_import
 from __future__ import unicode_literals
 
 import base64
+import binascii
+import socket
 import datetime
 import re
 from decimal import Decimal
@@ -69,6 +71,9 @@ def get_sasl_client(host, sasl_auth, service=None, username=None, password=None)
 def get_pure_sasl_client(host, sasl_auth, service=None, username=None, password=None):
     from pyhive.sasl_compat import PureSASLClient
 
+    if sasl_auth == 'GSSAPI' and not _pure_sasl_has_kerberos() and _has_gssapi():
+        from pyhive.sasl_compat import GSSAPIClient
+        return GSSAPIClient(host=host, service=service)
     if sasl_auth == 'GSSAPI':
         sasl_kwargs = {'service': service}
     elif sasl_auth == 'PLAIN':
@@ -77,6 +82,19 @@ def get_pure_sasl_client(host, sasl_auth, service=None, username=None, password=
         raise ValueError("sasl_auth only supports GSSAPI and PLAIN")
 
     return PureSASLClient(host=host, **sasl_kwargs)
+
+
+def _pure_sasl_has_kerberos():
+    from puresasl import mechanisms
+    return bool(getattr(mechanisms, 'have_kerberos', False))
+
+
+def _has_gssapi():
+    try:
+        import gssapi  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def get_installed_sasl(host, sasl_auth, service=None, username=None, password=None):
@@ -88,23 +106,76 @@ def get_installed_sasl(host, sasl_auth, service=None, username=None, password=No
         return get_pure_sasl_client(host=host, sasl_auth=sasl_auth, service=service, username=username, password=password)
     
 
-def _parse_timestamp(value):
+_warned_truncated_timestamp = False
+
+
+def _parse_timestamp(value, strict=False):
+    """Parse a Hive TIMESTAMP string into a ``datetime``.
+
+    Hive keeps nanoseconds, ``datetime`` only microseconds. Extra non-zero digits are
+    truncated (with a warning logged once per process) unless ``strict`` is set, in which case
+    ``DataError`` is raised. Trailing zero digits are dropped losslessly either way.
+    """
+    global _warned_truncated_timestamp
     if value:
         match = _TIMESTAMP_PATTERN.match(value)
         if match:
+            rest = value[match.end():]
+            if rest and not (rest.isdigit() and set(rest) == {'0'}):
+                if strict:
+                    raise DataError(
+                        'Cannot convert "{}" into a datetime without losing precision; '
+                        'cast the column to STRING to read it exactly'.format(value))
+                if not _warned_truncated_timestamp:
+                    _warned_truncated_timestamp = True
+                    _logger.warning(
+                        'Truncating TIMESTAMP "%s" to microseconds; pass '
+                        'strict_timestamps=True to raise DataError instead '
+                        '(this warning is logged once)', value)
             if match.group(2):
                 format = '%Y-%m-%d %H:%M:%S.%f'
                 # use the pattern to truncate the value
                 value = match.group()
             else:
                 format = '%Y-%m-%d %H:%M:%S'
-            value = datetime.datetime.strptime(value, format)
+            try:
+                value = datetime.datetime.strptime(value, format)
+            except ValueError as e:  # e.g. year 0 or 10000
+                raise DataError('Invalid or out-of-range Hive TIMESTAMP {!r}: {}'.format(value, e))
         else:
-            raise Exception(
+            raise DataError(
                 'Cannot convert "{}" into a datetime'.format(value))
     else:
         value = None
     return value
+
+
+# Type ids newer than the bundled Thrift definitions (protocol V6 lists up to 21).
+_EXTRA_TYPE_NAMES = {22: 'TIMESTAMPLOCALTZ_TYPE'}
+
+
+def _type_name(type_id):
+    """Name of a Thrift type id; ids this module does not know are read as strings."""
+    name = ttypes.TTypeId._VALUES_TO_NAMES.get(type_id) or _EXTRA_TYPE_NAMES.get(type_id)
+    if name is None:
+        return ttypes.TTypeId._VALUES_TO_NAMES[ttypes.TTypeId.STRING_TYPE]
+    return name
+
+
+def _as_bool(value):
+    """Interpret a flag that may come from a SQLAlchemy URL query string."""
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ('1', 'true', 'yes', 'on'):
+            return True
+        if lowered in ('', '0', 'false', 'no', 'off'):
+            return False
+        raise ValueError('Expected a boolean, got {!r}'.format(value))
+    return bool(value)
+
+
+def _parse_timestamp_strict(value):
+    return _parse_timestamp(value, strict=True)
 
 
 TYPES_CONVERTER = {"DECIMAL_TYPE": Decimal,
@@ -112,6 +183,63 @@ TYPES_CONVERTER = {"DECIMAL_TYPE": Decimal,
 
 
 class HiveParamEscaper(common.ParamEscaper):
+    _BIGINT_MIN = -(2 ** 63)
+
+    def escape_item(self, item):
+        if isinstance(item, bool):
+            return 'true' if item else 'false'
+        if isinstance(item, Decimal):
+            return self.escape_decimal(item)
+        if isinstance(item, float):
+            return self.escape_float(item)
+        if isinstance(item, int) and item == self._BIGINT_MIN:
+            # -9223372036854775808 is parsed as the negation of a literal that does not fit
+            # in BIGINT, so Hive types it DECIMAL.
+            return '({} - 1)'.format(self._BIGINT_MIN + 1)
+        if isinstance(item, bytes):
+            # BINARY value: bytes are not text and may not be valid UTF-8.
+            return "unhex('{}')".format(binascii.hexlify(item).decode('ascii'))
+        if isinstance(item, datetime.datetime) and item.utcoffset() is not None:
+            raise ProgrammingError(
+                "Cannot bind timezone-aware datetime {!r}: Hive TIMESTAMP has no time zone. "
+                "Convert it to a naive datetime first.".format(item))
+        return super(HiveParamEscaper, self).escape_item(item)
+
+    # Hive DECIMAL holds at most 38 digits, of which at most 38 after the point.
+    _DECIMAL_MAX_PRECISION = 38
+
+    @classmethod
+    def _decimal_literal(cls, item):
+        """``item`` as plain digits, or None if Hive DECIMAL cannot hold it exactly."""
+        text = '{:f}'.format(item)
+        integer, _, fraction = text.lstrip('-').partition('.')
+        precision = len(integer.lstrip('0')) + len(fraction)
+        if precision > cls._DECIMAL_MAX_PRECISION:
+            return None
+        return text
+
+    def escape_decimal(self, item):
+        if not item.is_finite():
+            raise ProgrammingError("Hive DECIMAL cannot represent {}".format(item))
+        # Trailing fractional zeros carry no value; drop them if they are what does not fit.
+        text = self._decimal_literal(item) or self._decimal_literal(item.normalize())
+        if text is None:
+            # Hive would silently round it (e.g. 1E-40 -> 0) or turn it into NULL (1E+50).
+            raise ProgrammingError(
+                "Hive DECIMAL cannot represent {} exactly: it has more than {} digits"
+                .format(item, self._DECIMAL_MAX_PRECISION))
+        # BD makes Hive type the literal DECIMAL with every digit kept.
+        return '{}BD'.format(text)
+
+    def escape_float(self, item):
+        if item != item or item in (float('inf'), float('-inf')):
+            name = 'NaN' if item != item else ('Infinity' if item > 0 else '-Infinity')
+            return "CAST('{}' AS DOUBLE)".format(name)
+        # A plain 0.1 would be typed DECIMAL. The D suffix only exists from Hive 2.3, so cast
+        # instead, which every Hive version and Spark accept. repr(float(...)) is the shortest
+        # round-tripping form, also for float subclasses such as numpy.float64.
+        return 'CAST({!r} AS DOUBLE)'.format(float(item))
+
     def escape_string(self, item):
         # backslashes and single quotes need to be escaped
         # TODO verify against parser
@@ -159,7 +287,8 @@ class Connection(object):
         password=None,
         check_hostname=None,
         ssl_cert=None,
-        thrift_transport=None
+        thrift_transport=None,
+        strict_timestamps=False,
     ):
         """Connect to HiveServer2
 
@@ -172,6 +301,10 @@ class Connection(object):
         :param password: Use with auth='LDAP' or auth='CUSTOM' only
         :param thrift_transport: A ``TTransportBase`` for custom advanced usage.
             Incompatible with host, port, auth, kerberos_service_name, and password.
+        :param strict_timestamps: Hive TIMESTAMP values can carry nanoseconds, which
+            ``datetime`` cannot hold. By default the extra digits are truncated to microseconds
+            (a warning is logged once). Set to ``True`` to raise ``DataError`` instead. Can be
+            overridden per cursor with ``cursor(strict_timestamps=...)``.
 
         The way to support LDAP and GSSAPI is originated from cloudera/Impyla:
         https://github.com/cloudera/impyla/blob/255b07ed973d47a3395214ed92d35ec0615ebf62
@@ -206,6 +339,7 @@ class Connection(object):
                 None, None, None, None, None
             )
 
+        self.strict_timestamps = _as_bool(strict_timestamps)
         username = username or getpass.getuser()
         configuration = configuration or {}
 
@@ -260,19 +394,28 @@ class Connection(object):
                     "authentication are supported, got {}".format(auth))
 
         protocol = thrift.protocol.TBinaryProtocol.TBinaryProtocol(self._transport)
-        self._client = TCLIService.Client(protocol)
+        self._client = _ClientWrapper(TCLIService.Client(protocol))
         # oldest version that still contains features we care about
         # "V6 uses binary type for binary payload (was string) and uses columnar result set"
         protocol_version = ttypes.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6
 
         try:
-            self._transport.open()
+            try:
+                # Includes the SASL handshake, so bad credentials fail here too.
+                self._transport.open()
+            except _TRANSPORT_ERRORS as e:
+                raise _could_not_connect(e)
             open_session_req = ttypes.TOpenSessionReq(
                 client_protocol=protocol_version,
                 configuration=configuration,
                 username=username,
             )
-            response = self._client.OpenSession(open_session_req)
+            try:
+                response = self._client.OpenSession(open_session_req)
+            except OperationalError as e:
+                if is_connection_lost(e):
+                    raise _could_not_connect(e.__cause__)
+                raise
             _check_status(response)
             assert response.sessionHandle is not None, "Expected a session from OpenSession"
             self._sessionHandle = response.sessionHandle
@@ -334,8 +477,11 @@ class Connection(object):
     def close(self):
         """Close the underlying session and Thrift transport"""
         req = ttypes.TCloseSessionReq(sessionHandle=self._sessionHandle)
-        response = self._client.CloseSession(req)
-        self._transport.close()
+        try:
+            response = self._client.CloseSession(req)
+        finally:
+            # Release the socket even when the server is already gone.
+            self._transport.close()
         _check_status(response)
 
     def commit(self):
@@ -366,11 +512,15 @@ class Cursor(common.DBAPICursor):
     visible by other cursors or connections.
     """
 
-    def __init__(self, connection, arraysize=1000):
+    def __init__(self, connection, arraysize=1000, strict_timestamps=None):
         self._operationHandle = None
         super(Cursor, self).__init__()
         self._arraysize = arraysize
         self._connection = connection
+        if strict_timestamps is None:
+            strict_timestamps = getattr(connection, 'strict_timestamps', False)
+        #: Raise ``DataError`` instead of truncating TIMESTAMP values with nanoseconds.
+        self.strict_timestamps = _as_bool(strict_timestamps)
 
     def _reset_state(self):
         """Reset state about the previous query in preparation for running another query"""
@@ -432,7 +582,7 @@ class Cursor(common.DBAPICursor):
                     type_code = ttypes.TTypeId._VALUES_TO_NAMES[ttypes.TTypeId.STRING_TYPE]
                 else:
                     type_id = primary_type_entry.primitiveEntry.type
-                    type_code = ttypes.TTypeId._VALUES_TO_NAMES[type_id]
+                    type_code = _type_name(type_id)
                 self._description.append((
                     col.columnName.decode('utf-8') if sys.version_info[0] == 2 else col.columnName,
                     type_code.decode('utf-8') if sys.version_info[0] == 2 else type_code,
@@ -481,6 +631,13 @@ class Cursor(common.DBAPICursor):
         _check_status(response)
         self._operationHandle = response.operationHandle
 
+    def _discard_results(self):
+        # Statements without a result set (INSERT, DDL) have nothing to fetch, and a
+        # synchronous execute() has already waited for them to finish.
+        if self._operationHandle is not None and not self._operationHandle.hasResultSet:
+            return
+        super(Cursor, self)._discard_results()
+
     def cancel(self):
         req = ttypes.TCancelOperationReq(
             operationHandle=self._operationHandle,
@@ -503,8 +660,8 @@ class Cursor(common.DBAPICursor):
         _check_status(response)
         schema = self.description
         assert not response.results.rows, 'expected data in columnar format'
-        columns = [_unwrap_column(col, col_schema[1]) for col, col_schema in
-                   zip(response.results.columns, schema)]
+        columns = [_unwrap_column(col, col_schema[1], self.strict_timestamps)
+                   for col, col_schema in zip(response.results.columns, schema)]
         new_data = list(zip(*columns))
         self._data += new_data
         # response.hasMoreRows seems to always be False, so we instead check the number of rows
@@ -580,12 +737,31 @@ for type_id in constants.PRIMITIVE_TYPES:
     setattr(sys.modules[__name__], name, DBAPITypeObject([name]))
 
 
+# PEP 249 type constructors
+Date = datetime.date
+Time = datetime.time
+Timestamp = datetime.datetime
+Binary = bytes
+
+
+def DateFromTicks(ticks):
+    return Date.fromtimestamp(ticks)
+
+
+def TimeFromTicks(ticks):
+    return Timestamp.fromtimestamp(ticks).time()
+
+
+def TimestampFromTicks(ticks):
+    return Timestamp.fromtimestamp(ticks)
+
+
 #
 # Private utilities
 #
 
 
-def _unwrap_column(col, type_=None):
+def _unwrap_column(col, type_=None, strict_timestamps=False):
     """Return a list of raw values from a TColumn instance."""
     for attr, wrapper in iteritems(col.__dict__):
         if wrapper is not None:
@@ -598,10 +774,67 @@ def _unwrap_column(col, type_=None):
                     if byte & (1 << b):
                         result[i * 8 + b] = None
             converter = TYPES_CONVERTER.get(type_, None)
+            if type_ == 'TIMESTAMP_TYPE' and strict_timestamps:
+                converter = _parse_timestamp_strict
             if converter and type_:
                 result = [converter(row) if row else row for row in result]
             return result
     raise DataError("Got empty column value {}".format(col))  # pragma: no cover
+
+
+_TRANSPORT_ERRORS = (
+    thrift.transport.TTransport.TTransportException,
+    socket.error,
+    EOFError,
+)
+
+
+class _ClientWrapper(object):
+    """Proxy for the Thrift client that raises transport failures as ``OperationalError``.
+
+    A dropped or refused connection surfaces from Thrift as ``TTransportException`` or
+    ``socket.error``, which are not DB-API exceptions, so callers such as connection pools
+    cannot tell a lost connection from a programming error.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except _TRANSPORT_ERRORS as e:
+                raise _connection_lost(e)
+        return call
+
+
+def _connection_lost(e):
+    err = OperationalError('Lost connection to HiveServer2: {}'.format(e))
+    err.__cause__ = e
+    return err
+
+
+def _could_not_connect(e):
+    """A failure while opening the connection: refused, TLS/SASL handshake, bad credentials."""
+    err = OperationalError('Could not connect to HiveServer2: {}'.format(e))
+    err.__cause__ = e
+    err._pyhive_connect_failed = True
+    return err
+
+
+def is_connection_lost(e):
+    """True if ``e`` was raised because an established connection to HiveServer2 failed.
+
+    Failures while connecting (e.g. a rejected SASL handshake) are not a lost connection.
+    """
+    return (isinstance(e, OperationalError)
+            and isinstance(e.__cause__, _TRANSPORT_ERRORS)
+            and not getattr(e, '_pyhive_connect_failed', False))
 
 
 def _check_status(response):

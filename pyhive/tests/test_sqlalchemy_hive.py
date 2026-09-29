@@ -193,15 +193,17 @@ class TestSqlAlchemyHive(unittest.TestCase, SqlAlchemyTestCase):
         SELECT
             1, "a", "a", "a", "a", "a", 0.1,
             0.1, 0.1, 0, 0, "a", "a",
-            false, 1, 0, 0,
+            false, 1, CAST('1970-01-01' AS DATE), 0,
             "a", 1, 1,
-            0.1, 0.1, 0, 0, 0, "a",
+            0.1, 0.1, 0, CAST('1970-01-01' AS DATE), 0, "a",
             false, "a", "a",
-            0, :big_number, 123 + 2000
+            CAST('1970-01-01' AS DATE), :big_number, 123 + 2000
         FROM default.one_row
         """), {"big_number": big_number})
         row = connection.execute(text("select * from test_table")).fetchone()
-        self.assertEqual(row.hive_date, datetime.datetime(1970, 1, 1, 0, 0))
+        # Date columns are Hive DATE; the typed column converts the string value.
+        typed = connection.execute(table.select()).fetchone()
+        self.assertEqual(typed.hive_date, datetime.date(1970, 1, 1))
         self.assertEqual(row.hive_decimal, decimal.Decimal(big_number))
         self.assertEqual(row.hive_timestamp, datetime.datetime(1970, 1, 1, 0, 0, 2, 123000))
         table.drop(bind=connection)
