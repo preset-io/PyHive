@@ -3,8 +3,16 @@
 
 - Revert the Presto/Trino view exclusion introduced by 35a862c2.
   ``get_table_names`` returns SHOW TABLES directly again (including views),
-  without querying ``information_schema.views``. Superset already subtracts
-  ``get_view_names``; that method and its schema handling are unchanged.
+  without querying ``information_schema.views``, so table listing no longer
+  depends on that query being readable or fast. ``get_view_names`` and its
+  schema handling are unchanged.
+- Superset's Presto engine spec subtracts views itself (from its own
+  ``information_schema.tables`` query, for Presto and Hive only);
+  ``trino+pyhive`` users outside Superset's Presto spec will see views in
+  ``get_table_names`` again, as in <=0.7.0.3.
+- The Hive dialect still excludes views from ``get_table_names``, so the
+  Presto and Hive dialects deliberately differ on SQLAlchemy's "tables only"
+  contract in this release.
 
 0.7.0.4
 =======
