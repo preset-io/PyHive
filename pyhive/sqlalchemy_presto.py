@@ -418,10 +418,7 @@ class PrestoDialect(default.DefaultDialect):
         query = 'SHOW TABLES'
         if schema:
             query += ' FROM ' + self.identifier_preparer.quote_identifier(schema)
-        tables = [row.Table for row in connection.execute(text(query))]
-        # SHOW TABLES lists views too; get_view_names reports those separately.
-        views = set(self.get_view_names(connection, schema))
-        return [table for table in tables if table not in views]
+        return [row.Table for row in connection.execute(text(query))]
 
     def get_view_names(self, connection, schema=None, **kw):
         if schema is None:
