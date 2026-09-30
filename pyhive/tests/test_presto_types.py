@@ -418,18 +418,20 @@ class _TablesAndViewsSession(FakeSession):
 
 
 @pytest.mark.parametrize('scheme', ['presto', 'trino+pyhive'])
-def test_get_table_names_excludes_views(scheme):
+@pytest.mark.parametrize('schema', [None, 'other'])
+def test_get_table_names_leaves_view_subtraction_to_superset(scheme, schema):
     session = _TablesAndViewsSession()
     insp = sa.inspect(engine(session, scheme=scheme))
-    assert insp.get_table_names() == ['t_all']
-    assert insp.get_view_names() == ['v_all']
-
-
-def test_get_table_names_excludes_views_in_explicit_schema():
-    session = _TablesAndViewsSession()
-    assert sa.inspect(engine(session)).get_table_names(schema='other') == ['t_all']
-    assert session.statements[0] == 'SHOW TABLES FROM "other"'
-    assert "table_schema = 'other'" in session.statements[1]
+    tables = insp.get_table_names(schema=schema)
+    assert tables == ['t_all', 'v_all']
+    query = 'SHOW TABLES' if schema is None else 'SHOW TABLES FROM "other"'
+    assert session.statements == [query]
+    # Superset subtracts the separately reflected views from SHOW TABLES.
+    views = insp.get_view_names(schema=schema)
+    assert views == ['v_all']
+    assert set(tables) - set(views) == {'t_all'}
+    assert len(session.statements) == 2
+    assert "table_schema = '%s'" % (schema or 'analytics') in session.statements[1]
 
 
 # Primary key reflection.

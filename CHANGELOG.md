@@ -1,3 +1,11 @@
+0.7.0.5
+=======
+
+- Revert the Presto/Trino view exclusion introduced by 35a862c2.
+  ``get_table_names`` returns SHOW TABLES directly again (including views),
+  without querying ``information_schema.views``. Superset already subtracts
+  ``get_view_names``; that method and its schema handling are unchanged.
+
 0.7.0.4
 =======
 
